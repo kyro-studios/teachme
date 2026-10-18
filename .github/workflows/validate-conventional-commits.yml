@@ -1,0 +1,54 @@
+name: Validate Conventional Commits
+
+on:
+  push:
+  # squash でマージするとコミットメッセージが PR のタイトルになるため、タイトルの編集でも検証し直す
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  # Merge Queue を使うブランチで必須のチェックにするため、Merge Queue のテストでも検証する
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Node.js のセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: 依存関係のインストール
+        run: npm ci
+
+      - name: バージョン出力
+        run: |
+          git --version
+          node --version
+          npm --version
+          npx commitlint --version
+
+      - name: Push時に最新のコミットを検証する
+        if: github.event_name == 'push'
+        run: npx commitlint --last --verbose
+
+      - name: PRに対するすべてのコミットを検証する
+        if: github.event_name == 'pull_request'
+        run: npx commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }} --verbose
+
+      - name: PRのタイトルを検証する
+        if: github.event_name == 'pull_request'
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$TITLE" | npx commitlint --verbose
+
+      - name: Merge Queueでマージするコミットを検証する
+        if: github.event_name == 'merge_group'
+        run: npx commitlint --from ${{ github.event.merge_group.base_sha }} --to ${{ github.event.merge_group.head_sha }} --verbose

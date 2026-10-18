@@ -1,0 +1,895 @@
+name: Coding Agent (Claude)
+
+# 振り分け用のワークフローが、作成、修正、レビューの依頼ごとに手動実行 (workflow_dispatch) する。
+# 入力の形式は、すべてのエージェントのワークフローで共通にしている (仕様の 2.2)。
+# モデルと effort は依頼に含まれる値をそのまま使い、このワークフローには書かない (agents.json で決める)。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 依頼の種類 (create、fix、review)
+        type: string
+        required: true
+      stage:
+        description: 段階
+        type: string
+        required: true
+      issue-number:
+        description: 対象の Issue の番号
+        type: string
+        required: true
+      pull-request-number:
+        description: 対象の PR の番号 (作成のときは空)
+        type: string
+        required: false
+        default: ''
+      target-sha:
+        description: 作業を始めるコミット (修正のときは、PR の head)
+        type: string
+        required: true
+      request-run-id:
+        description: 依頼の Artifact を保存した、振り分け用のワークフローの実行の ID
+        type: string
+        required: true
+      request-id:
+        description: 依頼の識別子 (Artifact の中のファイル名)
+        type: string
+        required: true
+
+permissions: {}
+
+# 同じ PR のレビューは、新しい依頼が来たら古いものを取り消し、最新のコミットだけをレビューする。
+# 作成と修正は、同じ Issue や PR への作業を 1 つずつ行う (作業の途中で取り消さない)
+concurrency:
+  group: coding-agent-claude-${{ inputs.mode == 'review' && 'review' || 'work' }}-${{ inputs.pull-request-number || inputs.issue-number }}
+  cancel-in-progress: ${{ inputs.mode == 'review' }}
+
+jobs:
+  work:
+    name: Claude による作業
+    if: vars.CODING_AGENT_ENABLED == 'true' && (inputs.mode == 'create' || inputs.mode == 'fix')
+    runs-on: ubuntu-latest
+    # コードを変える段階 (プロジェクトの作成と実装タスク) では、ビルドやテストを実行するため、時間の上限を長くする
+    timeout-minutes: ${{ (inputs.stage == 'implementation' || inputs.stage == 'project') && 90 || 60 }}
+    # 作成担当には書き込み権限を持つトークンを渡さない (push と PR の作成は publish ジョブが行う)
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      # 依頼の Artifact を、振り分け用のワークフローの実行から取得する
+      actions: read
+    outputs:
+      agent: ${{ steps.request.outputs.agent }}
+      kind: ${{ steps.request.outputs.kind }}
+      # 実際に取り込んだ既定ブランチのコミット (取り込んでいなければ空)
+      merge-sha: ${{ steps.merge.outputs.sha }}
+      tests-failed: ${{ steps.test-result.outputs.tests-failed }}
+      criteria-failed: ${{ steps.criteria.outputs.failed }}
+      ci-unresolved: ${{ steps.ci-check.outputs.unresolved }}
+    steps:
+      - name: 作業を始めるコミットをチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target-sha }}
+          # 修正では、コンフリクトの解消のために既定ブランチを取り込むことがあるため、履歴をすべて取得する
+          fetch-depth: ${{ inputs.mode == 'fix' && '0' || '1' }}
+          persist-credentials: false
+
+      # 指示やスクリプトは既定ブランチのものを使い、作業ディレクトリの外に置く (変更内容に含めないため)
+      - name: 既定ブランチの仕組みをチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          path: coding-agent-trusted
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: 既定ブランチの仕組みを作業ディレクトリの外に移す
+        run: mv coding-agent-trusted "$RUNNER_TEMP/trusted"
+
+      - name: 依頼を取得する
+        uses: actions/download-artifact@v8
+        with:
+          name: coding-agent-requests
+          run-id: ${{ inputs.request-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/coding-agent-requests
+
+      - name: 依頼の内容を確かめる
+        id: request
+        env:
+          REQUEST_ID: ${{ inputs.request-id }}
+          MODE: ${{ inputs.mode }}
+          TARGET_SHA: ${{ inputs.target-sha }}
+          REQUEST_DIR: ${{ runner.temp }}/coding-agent-requests
+          TRUSTED: ${{ runner.temp }}/trusted
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUEST_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::依頼の識別子の形式が正しくありません: $REQUEST_ID"
+            exit 1
+          fi
+          request="$REQUEST_DIR/$REQUEST_ID.json"
+          if [ "$(jq -r '.mode' "$request")" != "$MODE" ] || [ "$(jq -r '.targetSha' "$request")" != "$TARGET_SHA" ]; then
+            echo "::error::依頼の内容が、ワークフローの入力と一致しません"
+            exit 1
+          fi
+          echo "agent=$(jq -r '.agent' "$request")" >> "$GITHUB_OUTPUT"
+          # コンフリクトと CI の失敗の修正では、取り込む既定ブランチのコミットが依頼に含まれる (どちらも同じコミット)
+          merge_sha="$(jq -r '.materials.conflict.baseSha // .materials.ciFailure.baseSha // ""' "$request")"
+          if [ -n "$merge_sha" ] && [[ ! "$merge_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::取り込むコミットの SHA が正しくありません: $merge_sha"
+            exit 1
+          fi
+          echo "merge-sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          # CI の失敗の修正では、失敗した CI の実行が依頼に含まれる (仕様の 9.2)
+          ci_run_id="$(jq -r '.materials.ciFailure.runId // ""' "$request")"
+          ci_run_attempt="$(jq -r '.materials.ciFailure.runAttempt // ""' "$request")"
+          if [ -n "$ci_run_id" ] && { [[ ! "$ci_run_id" =~ ^[1-9][0-9]{0,19}$ ]] || [[ ! "$ci_run_attempt" =~ ^[1-9][0-9]{0,4}$ ]]; }; then
+            echo "::error::失敗した CI の実行の ID か回数が正しくありません: $ci_run_id ($ci_run_attempt)"
+            exit 1
+          fi
+          echo "ci-run-id=$ci_run_id" >> "$GITHUB_OUTPUT"
+          echo "ci-run-attempt=$ci_run_attempt" >> "$GITHUB_OUTPUT"
+          # モデルと effort を Claude Code の引数にする (振り分け用のワークフローで形式を検証済み。念のため確かめる)
+          model="$(jq -r '.execution.model // ""' "$request")"
+          effort="$(jq -r '.execution.effort // ""' "$request")"
+          if [[ ! "$model" =~ ^([A-Za-z0-9][A-Za-z0-9._:/-]{0,99})?$ ]] || [[ ! "$effort" =~ ^[a-z]{0,20}$ ]]; then
+            echo "::error::依頼のモデルか effort の形式が正しくありません"
+            exit 1
+          fi
+          echo "execution-args=${model:+--model $model}${effort:+ --effort $effort}" >> "$GITHUB_OUTPUT"
+          # 実装計画は、ファイルを変更せずに計画を出力する。それ以外は、ファイルを変更してコミットメッセージなどを出力する。
+          # コードを変える段階 (プロジェクトの作成と実装タスク) では、ビルドやテストを確かめられるよう、コマンドの実行 (Bash) も許可する。
+          # プロジェクトの作成では、変更が要らないことも出力できる (作成のときだけ)
+          case "$(jq -r '.stage' "$request")" in
+            planning)
+              echo "kind=planning" >> "$GITHUB_OUTPUT"
+              echo "tools=Read,Glob,Grep" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$(jq -c . "$TRUSTED/.github/coding-agent/plan-schema.json")" >> "$GITHUB_OUTPUT"
+              ;;
+            implementation)
+              echo "kind=change" >> "$GITHUB_OUTPUT"
+              echo "code-stage=true" >> "$GITHUB_OUTPUT"
+              echo "tools=Read,Edit,Write,Glob,Grep,Bash" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$(jq -c . "$TRUSTED/.github/coding-agent/result-schema.json")" >> "$GITHUB_OUTPUT"
+              ;;
+            project)
+              echo "kind=change" >> "$GITHUB_OUTPUT"
+              echo "code-stage=true" >> "$GITHUB_OUTPUT"
+              echo "tools=Read,Edit,Write,Glob,Grep,Bash" >> "$GITHUB_OUTPUT"
+              schema="result-schema.json"
+              if [ "$MODE" = 'create' ]; then
+                schema="project-result-schema.json"
+              fi
+              echo "output-schema=$(jq -c . "$TRUSTED/.github/coding-agent/$schema")" >> "$GITHUB_OUTPUT"
+              ;;
+            specification)
+              # 仕様書の段階では、作成と修正のどちらでも、受け入れ基準も出力する (仕様の 10.2)
+              echo "kind=change" >> "$GITHUB_OUTPUT"
+              echo "acceptance-criteria=true" >> "$GITHUB_OUTPUT"
+              echo "tools=Read,Edit,Write,Glob,Grep" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$(jq -c . "$TRUSTED/.github/coding-agent/specification-result-schema.json")" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "kind=change" >> "$GITHUB_OUTPUT"
+              echo "tools=Read,Edit,Write,Glob,Grep" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$(jq -c . "$TRUSTED/.github/coding-agent/result-schema.json")" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+          # 実装タスクでは、割り当てられた受け入れ基準を、テストの機械的な実行の受け入れ基準の確認に渡す (仕様の 10.5)。
+          # 受け入れ基準のファイルが無い機能 (acceptanceCriteria が null) では、確認しない
+          if [ "$(jq -r '.stage' "$request")" = 'implementation' ] && [ "$(jq -r '.materials.acceptanceCriteria | type' "$request")" = 'array' ]; then
+            criteria="$(jq -r '.materials.acceptanceCriteria | join(" ")' "$request")"
+            if [[ ! "$criteria" =~ ^(AC[1-9][0-9]*-[1-9][0-9]*( |$))*$ ]]; then
+              echo "::error::割り当てられた受け入れ基準の識別子の形式が正しくありません: $criteria"
+              exit 1
+            fi
+            echo "acceptance-check=true" >> "$GITHUB_OUTPUT"
+            echo "acceptance-criteria=$criteria" >> "$GITHUB_OUTPUT"
+          fi
+
+      # コンフリクトと CI の失敗の修正では、既定ブランチのコミットを取り込み (コミットはしない)、コンフリクトの印をエージェントに解消させる。
+      # 取り込んだコミットを出力する (取り込むものが無ければ空。書き込みジョブは、空でなければマージのコミットとして push する)
+      - name: 既定ブランチを取り込む
+        id: merge
+        if: steps.request.outputs.merge-sha != ''
+        env:
+          MERGE_SHA: ${{ steps.request.outputs.merge-sha }}
+        run: |
+          set -euo pipefail
+          git config user.name coding-agent
+          git config user.email coding-agent@users.noreply.github.com
+          # チェックアウトで SHA を指定すると、そのコミットの履歴しか取得しないため、取り込むコミットを取得する
+          git fetch --no-tags origin "$MERGE_SHA"
+          # CI の失敗の修正で、既定ブランチに新しいコミットが無ければ取り込まない (コンフリクトしていれば、必ず新しいコミットがある)
+          if git merge-base --is-ancestor "$MERGE_SHA" HEAD; then
+            echo "既定ブランチのコミット $MERGE_SHA は、取り込み済みです"
+            : > "$RUNNER_TEMP/conflicts.txt"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # コンフリクトしても止めない。取り込みの途中の状態 (MERGE_HEAD) になっていることだけを確かめる
+          git merge --no-ff --no-commit "$MERGE_SHA" || true
+          if ! git rev-parse -q --verify MERGE_HEAD > /dev/null; then
+            echo "::error::既定ブランチのコミット $MERGE_SHA を取り込めませんでした"
+            exit 1
+          fi
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+          echo "コンフリクトしたファイル:"
+          cat "$RUNNER_TEMP/conflicts.txt"
+          echo "sha=$MERGE_SHA" >> "$GITHUB_OUTPUT"
+
+      # CI の失敗の修正では、失敗した CI のジョブのログの末尾を、指示に含める (仕様の 9.2)。
+      # 取得できなくても止めない (指示で、テストを実行して原因を確かめるよう伝える)
+      - name: 失敗した CI のログを取得する
+        if: steps.request.outputs.ci-run-id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.request.outputs.ci-run-id }}
+          RUN_ATTEMPT: ${{ steps.request.outputs.ci-run-attempt }}
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/ci-failure.log"
+          : > "$log"
+          jobs="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" --paginate \
+            --jq '.jobs[] | select(.conclusion == "failure") | "\(.id)\t\(.name)"')" || echo "::warning::失敗した CI のジョブを取得できませんでした"
+          while IFS=$'\t' read -r job_id job_name; do
+            [ -n "$job_id" ] || continue
+            {
+              echo "===== ジョブ: $job_name ====="
+              # ログには色の指定 (端末のエスケープシーケンス) が含まれ、gh api は出力を拒むため、curl で取得する。
+              # ログの取得先へのリダイレクトでは、curl は認証のヘッダーを送らない。
+              # 色の指定と行の先頭の時刻を除き、末尾だけを渡す (指示が長くなりすぎないようにする)
+              curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" |
+                sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z //' | tail -n 300
+            } >> "$log" || echo "::warning::ジョブ $job_id のログを取得できませんでした"
+          done <<< "$jobs"
+          echo "取得したログ: $(wc -l < "$log") 行"
+
+      - name: 作業の指示を作る
+        id: prompt
+        env:
+          REQUEST_FILE: ${{ runner.temp }}/coding-agent-requests/${{ inputs.request-id }}.json
+          TRUSTED: ${{ runner.temp }}/trusted
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
+          CI_RUN_ID: ${{ steps.request.outputs.ci-run-id }}
+        run: |
+          set -euo pipefail
+          node "$TRUSTED/.github/scripts/coding-agent/author-prompt.mjs" \
+            --request "$REQUEST_FILE" \
+            --prompts "$TRUSTED/.github/coding-agent/prompts" \
+            --prompt-out "$RUNNER_TEMP/author-prompt.md" \
+            ${MERGE_SHA:+--conflicts "$RUNNER_TEMP/conflicts.txt"} \
+            ${CI_RUN_ID:+--ci-log "$RUNNER_TEMP/ci-failure.log"}
+          delimiter="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "prompt<<$delimiter"
+            cat "$RUNNER_TEMP/author-prompt.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      # サブスクの OAuth のトークンがあれば、API キーより優先する (仕様の 2.4)。秘密の値そのものは渡さない
+      - name: 認証の方式を確かめる
+        env:
+          HAS_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_OAUTH_TOKEN" = 'true' ]; then
+            echo "Claude の認証: サブスクの OAuth のトークン (CLAUDE_CODE_OAUTH_TOKEN)"
+          elif [ "$HAS_API_KEY" = 'true' ]; then
+            echo "Claude の認証: API キー (ANTHROPIC_API_KEY)"
+          else
+            echo "::error::Secrets に CLAUDE_CODE_OAUTH_TOKEN も ANTHROPIC_API_KEY もありません"
+            exit 1
+          fi
+
+      - name: Claude Code で作業する
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Claude Code は両方あると API キーを使うため、OAuth のトークンがあるときは API キーを渡さない
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # 読み取り専用の GITHUB_TOKEN を渡し、Claude GitHub App の書き込み可能なトークンを使わせない
+          github_token: ${{ github.token }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allowed_bots: github-actions
+          # 文書の段階ではファイルを読み書きするだけ、実装計画では読むだけで、コマンドは実行しない。
+          # コードを変える段階では、コマンドも実行する (コマンドから認証の値を読めるため、漏れたときの被害を抑える。仕様の 6.3)
+          claude_args: >-
+            --allowedTools "${{ steps.request.outputs.tools }}"
+            --json-schema '${{ steps.request.outputs.output-schema }}'
+            ${{ steps.request.outputs.execution-args }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+
+      - name: 計画をまとめる
+        if: steps.request.outputs.kind == 'planning'
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+          PLAN_DIR: ${{ runner.temp }}/coding-agent-plan
+        run: |
+          set -euo pipefail
+          if [ -z "$STRUCTURED_OUTPUT" ]; then
+            echo "::error::作成担当が計画を出力しませんでした"
+            exit 1
+          fi
+          mkdir -p "$PLAN_DIR"
+          printf '%s' "$STRUCTURED_OUTPUT" > "$PLAN_DIR/plan.json"
+          jq . "$PLAN_DIR/plan.json"
+
+      - name: 計画を保存する
+        if: steps.request.outputs.kind == 'planning'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-plan
+          path: ${{ runner.temp }}/coding-agent-plan
+          retention-days: 30
+
+      # Markdown の見出しの下線 (=======) と区別するため、始まりと終わりの印だけを確かめる
+      - name: コンフリクトの印が残っていないか確かめる
+        if: steps.merge.outputs.sha != ''
+        run: |
+          set -euo pipefail
+          remaining=()
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f "$file" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$file"; then
+              remaining+=("$file")
+            fi
+          done < "$RUNNER_TEMP/conflicts.txt"
+          if [ "${#remaining[@]}" -gt 0 ]; then
+            echo "::error::コンフリクトの印が残っています: ${remaining[*]}"
+            exit 1
+          fi
+
+      # コードを変える段階では、エージェントの作業の後に scripts/test.sh を機械的に実行し、失敗したら直させる (仕様の 6.4)。
+      # GitHub Actions ではステップを繰り返せないため、テストの実行と直させるステップを、上限の最大値 (3 回) まで並べる
+      # (test-fix-prompt.mjs の MAX_TEST_FIX_ATTEMPTS と同じ回数にする)
+      - name: テストを機械的に実行するか確かめる
+        id: test-plan
+        if: steps.request.outputs.code-stage == 'true'
+        env:
+          TEST_MAX_FIX_ATTEMPTS: ${{ vars.TEST_MAX_FIX_ATTEMPTS }}
+          TRUSTED: ${{ runner.temp }}/trusted
+          TARGET_SHA: ${{ inputs.target-sha }}
+        run: |
+          set -euo pipefail
+          # 変更が無ければ (プロジェクトの作成で、変更が要らないと判断した場合など)、テストを実行しない
+          if [ -z "$(git status --porcelain)" ] && [ "$(git rev-parse HEAD)" = "$TARGET_SHA" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "変更が無いため、テストを実行しません"
+            exit 0
+          fi
+          max="$(node "$TRUSTED/.github/scripts/coding-agent/test-fix-prompt.mjs" --print-max-attempts)"
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "max-attempts=$max" >> "$GITHUB_OUTPUT"
+          echo "テストが失敗したときに直させる回数の上限: $max 回"
+
+      - name: テストを実行する (1 回目)
+        id: test-1
+        if: steps.test-plan.outputs.run == 'true'
+        continue-on-error: true
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          # プロジェクトの作成では、scripts/test.sh が無ければ失敗にする (作らせるため)
+          REQUIRE_TEST_SCRIPT: ${{ inputs.stage == 'project' }}
+          ACCEPTANCE_CHECK: ${{ steps.request.outputs.acceptance-check == 'true' }}
+          ACCEPTANCE_CRITERIA: ${{ steps.request.outputs.acceptance-criteria }}
+        run: bash "$TRUSTED/.github/scripts/coding-agent/run-tests.sh" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/test-1.log"
+
+      - name: テストの失敗を直させる指示を作る (1 回目)
+        id: fix-prompt-1
+        if: steps.test-1.outcome == 'failure' && steps.test-plan.outputs.max-attempts >= 1
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          PREVIOUS: ${{ steps.claude.outputs.structured_output }}
+          MAX_ATTEMPTS: ${{ steps.test-plan.outputs.max-attempts }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PREVIOUS" > "$RUNNER_TEMP/previous-1.json"
+          node "$TRUSTED/.github/scripts/coding-agent/test-fix-prompt.mjs" \
+            --prompt "$RUNNER_TEMP/author-prompt.md" \
+            --prompts "$TRUSTED/.github/coding-agent/prompts" \
+            --log "$RUNNER_TEMP/test-1.log" \
+            --previous "$RUNNER_TEMP/previous-1.json" \
+            --attempt 1 \
+            --max-attempts "$MAX_ATTEMPTS" \
+            --prompt-out "$RUNNER_TEMP/test-fix-1.md"
+          delimiter="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "prompt<<$delimiter"
+            cat "$RUNNER_TEMP/test-fix-1.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude Code にテストの失敗を直させる (1 回目)
+        id: claude-fix-1
+        if: steps.fix-prompt-1.outcome == 'success'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Claude Code は両方あると API キーを使うため、OAuth のトークンがあるときは API キーを渡さない
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # 読み取り専用の GITHUB_TOKEN を渡し、Claude GitHub App の書き込み可能なトークンを使わせない
+          github_token: ${{ github.token }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allowed_bots: github-actions
+          claude_args: >-
+            --allowedTools "${{ steps.request.outputs.tools }}"
+            --json-schema '${{ steps.request.outputs.output-schema }}'
+            ${{ steps.request.outputs.execution-args }}
+          prompt: ${{ steps.fix-prompt-1.outputs.prompt }}
+
+      - name: テストを実行する (2 回目)
+        id: test-2
+        if: steps.claude-fix-1.outcome == 'success'
+        continue-on-error: true
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          # プロジェクトの作成では、scripts/test.sh が無ければ失敗にする (作らせるため)
+          REQUIRE_TEST_SCRIPT: ${{ inputs.stage == 'project' }}
+          ACCEPTANCE_CHECK: ${{ steps.request.outputs.acceptance-check == 'true' }}
+          ACCEPTANCE_CRITERIA: ${{ steps.request.outputs.acceptance-criteria }}
+        run: bash "$TRUSTED/.github/scripts/coding-agent/run-tests.sh" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/test-2.log"
+
+      - name: テストの失敗を直させる指示を作る (2 回目)
+        id: fix-prompt-2
+        if: steps.test-2.outcome == 'failure' && steps.test-plan.outputs.max-attempts >= 2
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          PREVIOUS: ${{ steps.claude-fix-1.outputs.structured_output || steps.claude.outputs.structured_output }}
+          MAX_ATTEMPTS: ${{ steps.test-plan.outputs.max-attempts }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PREVIOUS" > "$RUNNER_TEMP/previous-2.json"
+          node "$TRUSTED/.github/scripts/coding-agent/test-fix-prompt.mjs" \
+            --prompt "$RUNNER_TEMP/author-prompt.md" \
+            --prompts "$TRUSTED/.github/coding-agent/prompts" \
+            --log "$RUNNER_TEMP/test-2.log" \
+            --previous "$RUNNER_TEMP/previous-2.json" \
+            --attempt 2 \
+            --max-attempts "$MAX_ATTEMPTS" \
+            --prompt-out "$RUNNER_TEMP/test-fix-2.md"
+          delimiter="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "prompt<<$delimiter"
+            cat "$RUNNER_TEMP/test-fix-2.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude Code にテストの失敗を直させる (2 回目)
+        id: claude-fix-2
+        if: steps.fix-prompt-2.outcome == 'success'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Claude Code は両方あると API キーを使うため、OAuth のトークンがあるときは API キーを渡さない
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # 読み取り専用の GITHUB_TOKEN を渡し、Claude GitHub App の書き込み可能なトークンを使わせない
+          github_token: ${{ github.token }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allowed_bots: github-actions
+          claude_args: >-
+            --allowedTools "${{ steps.request.outputs.tools }}"
+            --json-schema '${{ steps.request.outputs.output-schema }}'
+            ${{ steps.request.outputs.execution-args }}
+          prompt: ${{ steps.fix-prompt-2.outputs.prompt }}
+
+      - name: テストを実行する (3 回目)
+        id: test-3
+        if: steps.claude-fix-2.outcome == 'success'
+        continue-on-error: true
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          # プロジェクトの作成では、scripts/test.sh が無ければ失敗にする (作らせるため)
+          REQUIRE_TEST_SCRIPT: ${{ inputs.stage == 'project' }}
+          ACCEPTANCE_CHECK: ${{ steps.request.outputs.acceptance-check == 'true' }}
+          ACCEPTANCE_CRITERIA: ${{ steps.request.outputs.acceptance-criteria }}
+        run: bash "$TRUSTED/.github/scripts/coding-agent/run-tests.sh" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/test-3.log"
+
+      - name: テストの失敗を直させる指示を作る (3 回目)
+        id: fix-prompt-3
+        if: steps.test-3.outcome == 'failure' && steps.test-plan.outputs.max-attempts >= 3
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          PREVIOUS: ${{ steps.claude-fix-2.outputs.structured_output || steps.claude-fix-1.outputs.structured_output || steps.claude.outputs.structured_output }}
+          MAX_ATTEMPTS: ${{ steps.test-plan.outputs.max-attempts }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PREVIOUS" > "$RUNNER_TEMP/previous-3.json"
+          node "$TRUSTED/.github/scripts/coding-agent/test-fix-prompt.mjs" \
+            --prompt "$RUNNER_TEMP/author-prompt.md" \
+            --prompts "$TRUSTED/.github/coding-agent/prompts" \
+            --log "$RUNNER_TEMP/test-3.log" \
+            --previous "$RUNNER_TEMP/previous-3.json" \
+            --attempt 3 \
+            --max-attempts "$MAX_ATTEMPTS" \
+            --prompt-out "$RUNNER_TEMP/test-fix-3.md"
+          delimiter="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "prompt<<$delimiter"
+            cat "$RUNNER_TEMP/test-fix-3.md"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude Code にテストの失敗を直させる (3 回目)
+        id: claude-fix-3
+        if: steps.fix-prompt-3.outcome == 'success'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Claude Code は両方あると API キーを使うため、OAuth のトークンがあるときは API キーを渡さない
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # 読み取り専用の GITHUB_TOKEN を渡し、Claude GitHub App の書き込み可能なトークンを使わせない
+          github_token: ${{ github.token }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allowed_bots: github-actions
+          claude_args: >-
+            --allowedTools "${{ steps.request.outputs.tools }}"
+            --json-schema '${{ steps.request.outputs.output-schema }}'
+            ${{ steps.request.outputs.execution-args }}
+          prompt: ${{ steps.fix-prompt-3.outputs.prompt }}
+
+      - name: テストを実行する (4 回目)
+        id: test-4
+        if: steps.claude-fix-3.outcome == 'success'
+        continue-on-error: true
+        env:
+          TRUSTED: ${{ runner.temp }}/trusted
+          # プロジェクトの作成では、scripts/test.sh が無ければ失敗にする (作らせるため)
+          REQUIRE_TEST_SCRIPT: ${{ inputs.stage == 'project' }}
+          ACCEPTANCE_CHECK: ${{ steps.request.outputs.acceptance-check == 'true' }}
+          ACCEPTANCE_CRITERIA: ${{ steps.request.outputs.acceptance-criteria }}
+        run: bash "$TRUSTED/.github/scripts/coding-agent/run-tests.sh" "$GITHUB_WORKSPACE" "$RUNNER_TEMP/test-4.log"
+
+      - name: テストの結果をまとめる
+        id: test-result
+        if: steps.test-plan.outputs.run == 'true'
+        env:
+          T1: ${{ steps.test-1.outcome }}
+          T2: ${{ steps.test-2.outcome }}
+          T3: ${{ steps.test-3.outcome }}
+          T4: ${{ steps.test-4.outcome }}
+        run: |
+          set -euo pipefail
+          # 最後に実行したテストの結果で決める (実行しなかったステップは skipped)
+          last=""
+          for outcome in "$T1" "$T2" "$T3" "$T4"; do
+            if [ -n "$outcome" ] && [ "$outcome" != 'skipped' ]; then
+              last="$outcome"
+            fi
+          done
+          if [ "$last" = 'success' ]; then
+            echo "テストが通りました"
+          else
+            echo "tests-failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::決めた回数まで直させても、テストが通りませんでした。変更を取り込まずに、人に引き継ぎます"
+          fi
+
+      # 許可していないツールの使用が拒否された場合に、どのツールかをログに出す。
+      # やり取りの記録 (execution_file) にはコマンドの出力がそのまま含まれるため、Artifact には残さず、ツールの名前だけを出す
+      - name: 拒否されたツールを確かめる
+        if: always()
+        env:
+          EXECUTION_FILES: >-
+            ${{ steps.claude.outputs.execution_file }}
+            ${{ steps.claude-fix-1.outputs.execution_file }}
+            ${{ steps.claude-fix-2.outputs.execution_file }}
+            ${{ steps.claude-fix-3.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          for file in ${EXECUTION_FILES}; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              jq -r '.. | objects | select(.type? == "result") | .permission_denials[]? | .tool_name? // empty' "$file"
+            fi
+          done | sort | uniq -c | while read -r count name; do
+            echo "::warning::許可していないツールの使用が拒否されました: $name ($count 回)"
+          done
+
+      # 仕様書の段階では、エージェントの出力から、受け入れ基準のファイルを作る (仕様の 10.2)。
+      # Schema での検証 (Ajv) に要るため、既定ブランチの仕組みの依存パッケージを、エージェントの作業の後にインストールする
+      - name: 受け入れ基準のファイルを作る
+        id: criteria
+        if: steps.request.outputs.acceptance-criteria == 'true'
+        env:
+          REQUEST_FILE: ${{ runner.temp }}/coding-agent-requests/${{ inputs.request-id }}.json
+          TRUSTED: ${{ runner.temp }}/trusted
+          TARGET_SHA: ${{ inputs.target-sha }}
+          STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          (cd "$TRUSTED" && npm ci --ignore-scripts --no-audit --no-fund)
+          printf '%s' "$STRUCTURED_OUTPUT" > "$RUNNER_TEMP/acceptance-criteria-output.json"
+          if ! node "$TRUSTED/.github/scripts/coding-agent/acceptance-criteria.mjs" \
+            --request "$REQUEST_FILE" \
+            --output "$RUNNER_TEMP/acceptance-criteria-output.json" \
+            --base-sha "$TARGET_SHA"; then
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::エージェントが出力した受け入れ基準を検証できませんでした。変更を取り込まずに、人に引き継ぎます"
+          fi
+
+      # CI の失敗の修正で、既定ブランチに新しいコミットが無く、エージェントも何も変えなかったら、人に引き継ぐ (仕様の 9.2)。
+      # このまま終えると、PR は CI が失敗したまま止まってしまうため
+      - name: CI の失敗の修正で変更があるか確かめる
+        id: ci-check
+        if: steps.request.outputs.ci-run-id != ''
+        env:
+          TARGET_SHA: ${{ inputs.target-sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(git status --porcelain)" ] && [ "$(git rev-parse HEAD)" = "$TARGET_SHA" ]; then
+            echo "unresolved=true" >> "$GITHUB_OUTPUT"
+            echo "::error::CI の失敗の修正で、変更がありませんでした。人に引き継ぎます"
+          fi
+
+      - name: 変更内容をまとめる
+        if: steps.request.outputs.kind == 'change' && steps.test-result.outputs.tests-failed != 'true' && steps.criteria.outputs.failed != 'true' && steps.ci-check.outputs.unresolved != 'true'
+        env:
+          TARGET_SHA: ${{ inputs.target-sha }}
+          # テストの失敗を直させた場合は、最後に直させた作業の出力 (変更の全体について書き直したもの) を使う
+          STRUCTURED_OUTPUT: ${{ steps.claude-fix-3.outputs.structured_output || steps.claude-fix-2.outputs.structured_output || steps.claude-fix-1.outputs.structured_output || steps.claude.outputs.structured_output }}
+          RESULT_DIR: ${{ runner.temp }}/coding-agent-result
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULT_DIR"
+          printf '%s' "$STRUCTURED_OUTPUT" > "$RESULT_DIR/result.json"
+          # エージェントが指示に反してコミットしていても漏れないよう、作業を始めたコミットと比較する
+          git add --all
+          git diff --cached --binary "$TARGET_SHA" > "$RESULT_DIR/changes.patch"
+          git diff --cached --stat "$TARGET_SHA"
+
+      - name: 変更内容を保存する
+        if: steps.request.outputs.kind == 'change' && steps.test-result.outputs.tests-failed != 'true' && steps.criteria.outputs.failed != 'true' && steps.ci-check.outputs.unresolved != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-result
+          path: ${{ runner.temp }}/coding-agent-result
+          retention-days: 7
+
+  publish:
+    needs: work
+    # テストが通らなかった変更と、受け入れ基準を作れなかった変更は取り込まない。CI の失敗の修正で変更が無ければ、push するものが無い
+    # (人への引き継ぎは hand-over ジョブが行う)
+    if: needs.work.outputs.kind == 'change' && needs.work.outputs.tests-failed != 'true' && needs.work.outputs.criteria-failed != 'true' && needs.work.outputs.ci-unresolved != 'true'
+    uses: ./.github/workflows/coding-agent-publish.yml
+    permissions:
+      contents: read
+    with:
+      agent: ${{ needs.work.outputs.agent }}
+      mode: ${{ inputs.mode }}
+      issue-number: ${{ inputs.issue-number }}
+      pull-request-number: ${{ inputs.pull-request-number }}
+      target-sha: ${{ inputs.target-sha }}
+      artifact-name: coding-agent-result
+      merge-sha: ${{ needs.work.outputs.merge-sha }}
+    secrets:
+      # Organization か利用するリポジトリの Secrets に登録した、Claude 用の App の秘密鍵
+      app-private-key: ${{ secrets.CODING_AGENT_CLAUDE_PRIVATE_KEY }}
+
+  # テストが通らなかったら (仕様の 6.4)、受け入れ基準のファイルを作れなかったら (仕様の 10.2)、
+  # または CI の失敗の修正で変更が無かったら (仕様の 9.2)、振り分け用のワークフローを手動実行し、進行役の App で人に引き継ぐ。
+  # このワークフローは進行役の App の秘密鍵を持たないため、needs-human ラベルを付けるのは振り分け用のワークフローが行う
+  hand-over:
+    name: 人への引き継ぎ
+    needs: work
+    if: needs.work.outputs.tests-failed == 'true' || needs.work.outputs.criteria-failed == 'true' || needs.work.outputs.ci-unresolved == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: 振り分け用のワークフローに、人への引き継ぎを依頼する
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 作成のときは段階の Issue に、修正のときは PR に引き継ぐ
+          NUMBER: ${{ inputs.mode == 'fix' && inputs.pull-request-number || inputs.issue-number }}
+          REASON: ${{ needs.work.outputs.criteria-failed == 'true' && 'acceptance-criteria' || needs.work.outputs.ci-unresolved == 'true' && 'ci-unresolved' || 'test-failure' }}
+        run: |
+          set -euo pipefail
+          gh workflow run coding-agent-router.yml -R "$GITHUB_REPOSITORY" \
+            -f issue-number="$NUMBER" \
+            -f hand-over="$REASON" \
+            -f source-run-id="$GITHUB_RUN_ID"
+          echo "::error::変更を取り込まずに、#$NUMBER を人に引き継ぎました ($REASON)"
+          exit 1
+
+  # 実装計画では、計画から進行役の App で実装タスクの Issue を作る
+  tasks:
+    needs: work
+    if: needs.work.outputs.kind == 'planning'
+    uses: ./.github/workflows/coding-agent-tasks.yml
+    permissions:
+      contents: read
+    with:
+      planning-issue-number: ${{ inputs.issue-number }}
+      artifact-name: coding-agent-plan
+    secrets:
+      # Organization か利用するリポジトリの Secrets に登録した、進行役の App の秘密鍵
+      coordinator-private-key: ${{ secrets.CODING_AGENT_COORDINATOR_PRIVATE_KEY }}
+
+  review:
+    name: Claude によるレビュー
+    if: vars.CODING_AGENT_ENABLED == 'true' && inputs.mode == 'review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # レビュー担当には書き込み権限を持つトークンを渡さない (レビューの投稿とマージは publish-review ジョブが行う)
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      # 依頼の Artifact を、振り分け用のワークフローの実行から取得する
+      actions: read
+    outputs:
+      agent: ${{ steps.request.outputs.agent }}
+    steps:
+      - name: レビューする PR をチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target-sha }}
+          # 依頼に含まれる PR のベースとの差分を確かめられるようにする
+          fetch-depth: 0
+          persist-credentials: false
+
+      # 指示やスクリプトは、PR の変更で書き換えられないよう、既定ブランチのものを使い、PR のディレクトリの外に置く
+      - name: 既定ブランチの仕組みをチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          path: coding-agent-trusted
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: 既定ブランチの仕組みを PR のディレクトリの外に移す
+        run: mv coding-agent-trusted "$RUNNER_TEMP/trusted"
+
+      - name: 依頼を取得する
+        uses: actions/download-artifact@v8
+        with:
+          name: coding-agent-requests
+          run-id: ${{ inputs.request-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/coding-agent-requests
+
+      - name: 依頼の内容を確かめる
+        id: request
+        env:
+          REQUEST_ID: ${{ inputs.request-id }}
+          TARGET_SHA: ${{ inputs.target-sha }}
+          REQUEST_DIR: ${{ runner.temp }}/coding-agent-requests
+          TRUSTED: ${{ runner.temp }}/trusted
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUEST_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::依頼の識別子の形式が正しくありません: $REQUEST_ID"
+            exit 1
+          fi
+          request="$REQUEST_DIR/$REQUEST_ID.json"
+          if [ "$(jq -r '.mode' "$request")" != 'review' ] || [ "$(jq -r '.targetSha' "$request")" != "$TARGET_SHA" ]; then
+            echo "::error::依頼の内容が、ワークフローの入力と一致しません"
+            exit 1
+          fi
+          echo "agent=$(jq -r '.agent' "$request")" >> "$GITHUB_OUTPUT"
+          # モデルと effort を Claude Code の引数にする (振り分け用のワークフローで形式を検証済み。念のため確かめる)
+          model="$(jq -r '.execution.model // ""' "$request")"
+          effort="$(jq -r '.execution.effort // ""' "$request")"
+          if [[ ! "$model" =~ ^([A-Za-z0-9][A-Za-z0-9._:/-]{0,99})?$ ]] || [[ ! "$effort" =~ ^[a-z]{0,20}$ ]]; then
+            echo "::error::依頼のモデルか effort の形式が正しくありません"
+            exit 1
+          fi
+          echo "execution-args=${model:+--model $model}${effort:+ --effort $effort}" >> "$GITHUB_OUTPUT"
+          echo "output-schema=$(jq -c . "$TRUSTED/.github/coding-agent/review-schema.json")" >> "$GITHUB_OUTPUT"
+
+      - name: レビューの指示を作る
+        id: prompt
+        env:
+          REQUEST_FILE: ${{ runner.temp }}/coding-agent-requests/${{ inputs.request-id }}.json
+          REVIEW_DIR: ${{ runner.temp }}/coding-agent-review
+          TRUSTED: ${{ runner.temp }}/trusted
+        run: |
+          set -euo pipefail
+          mkdir -p "$REVIEW_DIR"
+          node "$TRUSTED/.github/scripts/coding-agent/review-prompt.mjs" \
+            --request "$REQUEST_FILE" \
+            --prompts "$TRUSTED/.github/coding-agent/prompts/review" \
+            --prompt-out "$REVIEW_DIR/prompt.md" \
+            --review-out "$REVIEW_DIR/review.json"
+          if [ -f "$REVIEW_DIR/prompt.md" ]; then
+            delimiter="PROMPT_$(openssl rand -hex 16)"
+            {
+              echo "prompt<<$delimiter"
+              cat "$REVIEW_DIR/prompt.md"
+              echo "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # サブスクの OAuth のトークンがあれば、API キーより優先する (仕様の 2.4)。秘密の値そのものは渡さない
+      - name: 認証の方式を確かめる
+        if: steps.prompt.outputs.skip-review != 'true'
+        env:
+          HAS_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+          HAS_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_OAUTH_TOKEN" = 'true' ]; then
+            echo "Claude の認証: サブスクの OAuth のトークン (CLAUDE_CODE_OAUTH_TOKEN)"
+          elif [ "$HAS_API_KEY" = 'true' ]; then
+            echo "Claude の認証: API キー (ANTHROPIC_API_KEY)"
+          else
+            echo "::error::Secrets に CLAUDE_CODE_OAUTH_TOKEN も ANTHROPIC_API_KEY もありません"
+            exit 1
+          fi
+
+      # 変更してよい範囲の外にあるファイルが変更されていれば、Claude を呼ばずに差し戻す (review.json は作成済み)
+      - name: Claude Code でレビューする
+        id: claude
+        if: steps.prompt.outputs.skip-review != 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Claude Code は両方あると API キーを使うため、OAuth のトークンがあるときは API キーを渡さない
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # 読み取り専用の GITHUB_TOKEN を渡し、Claude GitHub App の書き込み可能なトークンを使わせない
+          github_token: ${{ github.token }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allowed_bots: github-actions
+          # ファイルの編集をさせず、読むことと、差分を確かめる git のコマンドだけを許可する
+          claude_args: >-
+            --allowedTools "Read,Glob,Grep,Bash(git diff *),Bash(git log *),Bash(git show *)"
+            --json-schema '${{ steps.request.outputs.output-schema }}'
+            ${{ steps.request.outputs.execution-args }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+
+      # 許可していないツールの使用が拒否された場合に、どのツールかをログに出す。
+      # やり取りの記録 (execution_file) にはコマンドの出力がそのまま含まれるため、Artifact には残さず、ツールの名前だけを出す
+      - name: 拒否されたツールを確かめる
+        if: always()
+        env:
+          EXECUTION_FILES: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          for file in ${EXECUTION_FILES}; do
+            if [ -n "$file" ] && [ -f "$file" ]; then
+              jq -r '.. | objects | select(.type? == "result") | .permission_denials[]? | .tool_name? // empty' "$file"
+            fi
+          done | sort | uniq -c | while read -r count name; do
+            echo "::warning::許可していないツールの使用が拒否されました: $name ($count 回)"
+          done
+
+      - name: レビューの結果をまとめる
+        if: steps.prompt.outputs.skip-review != 'true'
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
+          REVIEW_FILE: ${{ runner.temp }}/coding-agent-review/review.json
+        run: |
+          set -euo pipefail
+          if [ -z "$STRUCTURED_OUTPUT" ]; then
+            echo "::error::レビュー担当がレビューの結果を出力しませんでした"
+            exit 1
+          fi
+          printf '%s' "$STRUCTURED_OUTPUT" > "$REVIEW_FILE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-review
+          path: ${{ runner.temp }}/coding-agent-review/review.json
+          retention-days: 7
+
+  publish-review:
+    needs: review
+    uses: ./.github/workflows/coding-agent-publish-review.yml
+    permissions:
+      contents: read
+      # 差し戻したら、振り分け用のワークフローを手動実行して修正を依頼する
+      actions: write
+    with:
+      agent: ${{ needs.review.outputs.agent }}
+      stage: ${{ inputs.stage }}
+      pull-request-number: ${{ inputs.pull-request-number }}
+      target-sha: ${{ inputs.target-sha }}
+      artifact-name: coding-agent-review
+    secrets:
+      # Organization か利用するリポジトリの Secrets に登録した、Claude 用の App の秘密鍵
+      app-private-key: ${{ secrets.CODING_AGENT_CLAUDE_PRIVATE_KEY }}

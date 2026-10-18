@@ -1,0 +1,192 @@
+name: Coding Agent Router
+
+on:
+  issues:
+    types: [opened, edited, labeled, closed]
+  # 振り分けの処理は既定ブランチのものを使い、PR のコードは実行しない (PR の変更で振り分けを書き換えられないようにする)
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, unlabeled]
+  # 既定ブランチが更新されたら、エージェントの PR がコンフリクトしていないか調べる (既定ブランチ以外の push はジョブの if で除く)
+  push:
+  # アプリケーションの CI が失敗したら、PR を作ったエージェントに修正させる (仕様の 9.2)。
+  # workflow_run は対象のワークフローを名前で固定に書く必要がある (coding-agent-test.yml の name)
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      issue-number:
+        description: 対象の Issue 番号
+        type: string
+        required: true
+      force:
+        description: 起動済みでも再実行する
+        type: boolean
+        required: false
+        default: false
+      # エージェントのワークフローが、人への引き継ぎを依頼するときに指定する (handlers/hand-over.mjs)
+      hand-over:
+        description: 人に引き継ぐ理由 (test-failure、acceptance-criteria、ci-unresolved のどれか)。空なら、段階の起動と修正の依頼を行う
+        type: string
+        required: false
+        default: ''
+      source-run-id:
+        description: 人への引き継ぎのきっかけになった、エージェントのワークフローの実行の ID
+        type: string
+        required: false
+        default: ''
+
+permissions: {}
+
+jobs:
+  route:
+    name: 振り分け
+    # テンプレート自体や、セットアップ前のリポジトリでは、ランナーを起動せずに終える。
+    # 振り分けが扱いうるイベントのときだけランナーを起動する。ここでは agents.json を読めないため、条件は粗くし、
+    # 細かい判定は各ハンドラーの matches に任せる
+    # - push: 既定ブランチへのものだけ (エージェントのブランチへの push では起動しない)
+    # - Issue の作成と編集: feature ラベルの付いた Issue (機能の開始) だけ。段階の Issue や実装タスクの Issue の作成では起動しない
+    # - Issue のラベル付け: 担当のエージェントのラベル (agent:<識別子>) だけ (段階の起動)。startsWith は大文字と小文字を区別しない
+    # - CI の完了: 失敗したものだけ (CI の失敗の検知)
+    # - Issue の Close、PR のイベント (on の types で絞ってある)、手動実行: 常に
+    if: >-
+      vars.CODING_AGENT_ENABLED == 'true' && (
+        github.event_name == 'workflow_dispatch' ||
+        github.event_name == 'pull_request_target' ||
+        (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure') ||
+        (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+        (github.event_name == 'issues' && (
+          github.event.action == 'closed' ||
+          (github.event.action == 'labeled' && startsWith(github.event.label.name, 'agent:')) ||
+          ((github.event.action == 'opened' || github.event.action == 'edited') && contains(github.event.issue.labels.*.name, 'feature'))
+        ))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 同じ Issue や PR のイベントは 1 つずつ処理する (段階の Issue を二重に作らないため)。
+    # PR は新しい push があれば古いものを取り消し、最新のコミットだけをレビューに回す。既定ブランチへの push は 1 つずつ処理する。
+    # CI の完了は、実行ごとに処理する (PR の番号は、振り分けをやり直した後の、PR ごとの concurrency の中で扱う)
+    concurrency:
+      group: coding-agent-router-${{ github.event.issue.number || github.event.pull_request.number || inputs.issue-number || (github.event_name == 'workflow_run' && format('run-{0}', github.event.workflow_run.id)) || 'push' }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      dispatches: ${{ steps.route.outputs.dispatches }}
+      redispatch-issues: ${{ steps.route.outputs.redispatch-issues }}
+    steps:
+      # cone モードでは、ルート直下のファイル (package.json など) もチェックアウトされる
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github
+          persist-credentials: false
+
+      # postinstall の husky の初期化を動かさないよう、スクリプトを実行せずにインストールする
+      - name: 依存パッケージをインストールする
+        run: npm ci --ignore-scripts
+
+      # 読み取り専用の GITHUB_TOKEN で判定し、処理するイベントのときだけ進行役の App のトークンを発行する
+      - name: 振り分けの対象か判定する
+        id: match
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { match } = await import(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/coding-agent/route.mjs`
+            );
+            await match({ github, context, core });
+
+      - name: 進行役の App のトークンを発行する
+        id: app-token
+        if: steps.match.outputs.handled == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ steps.match.outputs.coordinator-client-id }}
+          # Organization か利用するリポジトリの Secrets に登録した、進行役の App の秘密鍵
+          private-key: ${{ secrets.CODING_AGENT_COORDINATOR_PRIVATE_KEY }}
+          permission-issues: write
+          # PR へのコメント、ラベル付け、Assign (修正の依頼や人への引き継ぎ) に使う
+          permission-pull-requests: write
+          permission-contents: read
+
+      - name: 振り分ける
+        id: route
+        if: steps.match.outputs.handled == 'true'
+        uses: actions/github-script@v9
+        env:
+          REQUEST_DIR: ${{ runner.temp }}/coding-agent-requests
+          # エージェントが修正する回数の上限 (未設定なら 3)
+          REVIEW_MAX_FIX_ROUNDS: ${{ vars.REVIEW_MAX_FIX_ROUNDS }}
+          # 1 回の実装計画で作成できる実装タスクの上限 (未設定なら 30)
+          PLANNER_MAX_TASKS: ${{ vars.PLANNER_MAX_TASKS }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const { route } = await import(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/coding-agent/route.mjs`
+            );
+            await route({ github, context, core });
+
+      # PR の CI の 1 回目の失敗は、失敗したジョブだけを一度再実行する (仕様の 9.2)。GITHUB_TOKEN による再実行では、
+      # 終わったときに workflow_run が起きるかを確認できないため、進行役の App で行う。Actions の書き込み権限は、
+      # 再実行するときだけ含める
+      - name: CI を再実行するための、進行役の App のトークンを発行する
+        id: rerun-token
+        if: steps.route.outputs.rerun-runs != '' && steps.route.outputs.rerun-runs != '[]'
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ steps.match.outputs.coordinator-client-id }}
+          private-key: ${{ secrets.CODING_AGENT_COORDINATOR_PRIVATE_KEY }}
+          permission-actions: write
+
+      - name: 失敗した CI を再実行する
+        if: steps.rerun-token.outcome == 'success'
+        uses: actions/github-script@v9
+        env:
+          RERUN_RUNS: ${{ steps.route.outputs.rerun-runs }}
+        with:
+          github-token: ${{ steps.rerun-token.outputs.token }}
+          script: |
+            for (const runId of JSON.parse(process.env.RERUN_RUNS)) {
+              await github.rest.actions.reRunWorkflowFailedJobs({ ...context.repo, run_id: runId });
+              core.info(`CI の実行 ${runId} の、失敗したジョブを再実行しました`);
+            }
+
+      - name: エージェントへの依頼を保存する
+        if: steps.route.outputs.dispatches != '' && steps.route.outputs.dispatches != '[]'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-requests
+          path: ${{ runner.temp }}/coding-agent-requests
+          retention-days: 7
+
+  dispatch:
+    name: エージェントの呼び出し
+    needs: route
+    if: >-
+      (needs.route.outputs.dispatches != '' && needs.route.outputs.dispatches != '[]') ||
+      (needs.route.outputs.redispatch-issues != '' && needs.route.outputs.redispatch-issues != '[]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: エージェントと振り分けのワークフローを手動実行する
+        uses: actions/github-script@v9
+        env:
+          DISPATCHES: ${{ needs.route.outputs.dispatches }}
+          REDISPATCH_ISSUES: ${{ needs.route.outputs.redispatch-issues }}
+        with:
+          script: |
+            const { default: dispatchAgents } = await import(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/coding-agent/dispatch-agents.mjs`
+            );
+            await dispatchAgents({ github, context, core });

@@ -1,0 +1,24 @@
+{
+  "$schema": "./stages-schema.json",
+  "featureRoot": "docs/features",
+  "stages": {
+    "requirements": {
+      "allow": ["{featureDir}/requirements.md"]
+    },
+    "specification": {
+      "allow": ["{featureDir}/specification.md", "{featureDir}/acceptance-criteria.json"]
+    },
+    "domain-model": {
+      "allow": ["{featureDir}/domain-model.md"]
+    },
+    "architecture": {
+      "allow": ["{featureDir}/architecture.md", "docs/architecture.md", "docs/api/openapi.yaml"]
+    },
+    "project": {
+      "allow": ["app/**", "architecture-rules/**", "scripts/test.sh", "scripts/start-app.sh", "scripts/test.Dockerfile"]
+    },
+    "implementation": {
+      "allow": ["app/**", "acceptance/tests/**"]
+    }
+  }
+}

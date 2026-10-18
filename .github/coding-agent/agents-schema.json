@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Coding Agent のエージェントの登録",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "coordinator": {
+      "description": "進行役の GitHub App。段階の Issue の作成や親 Issue の Close など、振り分け用のワークフローの書き込みに使う",
+      "type": "object",
+      "properties": {
+        "bot": { "$ref": "#/$defs/bot" },
+        "appClientId": { "$ref": "#/$defs/appClientId" }
+      },
+      "required": ["bot", "appClientId"],
+      "additionalProperties": false
+    },
+    "agents": {
+      "description": "登録するエージェント。キーはエージェントの識別子。担当を表すラベル (agent:<識別子>) を 50 文字以内に収めるため、識別子は 44 文字以内にする",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]{0,43}$"
+      },
+      "minProperties": 1,
+      "additionalProperties": {
+        "$ref": "#/$defs/agent"
+      }
+    },
+    "roles": {
+      "description": "段階ごとの担当と、担当が使うモデルと effort",
+      "type": "object",
+      "properties": {
+        "requirements": {
+          "description": "要件定義。作成は人が行う",
+          "type": "object",
+          "properties": {
+            "reviewer": { "$ref": "#/$defs/assignment" }
+          },
+          "required": ["reviewer"],
+          "additionalProperties": false
+        },
+        "specification": { "$ref": "#/$defs/reviewedStage" },
+        "domain-model": { "$ref": "#/$defs/reviewedStage" },
+        "architecture": { "$ref": "#/$defs/reviewedStage" },
+        "project": { "$ref": "#/$defs/reviewedStage" },
+        "planning": {
+          "description": "実装計画。レビューは無い",
+          "type": "object",
+          "properties": {
+            "author": { "$ref": "#/$defs/assignment" }
+          },
+          "required": ["author"],
+          "additionalProperties": false
+        },
+        "implementation": {
+          "description": "実装タスク",
+          "type": "object",
+          "properties": {
+            "implementers": {
+              "description": "実装計画で実装タスクに割り当ててよいエージェント",
+              "type": "array",
+              "items": { "$ref": "#/$defs/assignment" },
+              "minItems": 1
+            },
+            "reviewer": { "$ref": "#/$defs/assignment" }
+          },
+          "required": ["implementers", "reviewer"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["requirements", "specification", "domain-model", "architecture", "project", "planning", "implementation"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["coordinator", "agents", "roles"],
+  "additionalProperties": false,
+  "$defs": {
+    "agentId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,43}$"
+    },
+    "bot": {
+      "description": "GitHub App の Bot 名 (<slug>[bot])",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*\\[bot\\]$"
+    },
+    "appClientId": {
+      "description": "GitHub App の Client ID",
+      "type": "string",
+      "minLength": 1
+    },
+    "model": {
+      "description": "使うモデル。省略するか null なら、エージェントのツールの既定",
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$"
+    },
+    "effort": {
+      "description": "使う effort (推論の深さ)。指定できる値はエージェントのツールとモデルによる。省略するか null なら、ツールの既定",
+      "type": ["string", "null"],
+      "pattern": "^[a-z]{1,20}$"
+    },
+    "execution": {
+      "description": "モデルと effort",
+      "type": "object",
+      "properties": {
+        "model": { "$ref": "#/$defs/model" },
+        "effort": { "$ref": "#/$defs/effort" }
+      },
+      "additionalProperties": false
+    },
+    "assignment": {
+      "description": "担当のエージェントと、そのエージェントが使うモデルと effort",
+      "type": "object",
+      "properties": {
+        "agent": { "$ref": "#/$defs/agentId" },
+        "model": { "$ref": "#/$defs/model" },
+        "effort": { "$ref": "#/$defs/effort" }
+      },
+      "required": ["agent"],
+      "additionalProperties": false
+    },
+    "reviewedStage": {
+      "description": "作成担当とレビュー担当がいる文書の段階",
+      "type": "object",
+      "properties": {
+        "author": { "$ref": "#/$defs/assignment" },
+        "reviewer": { "$ref": "#/$defs/assignment" }
+      },
+      "required": ["author", "reviewer"],
+      "additionalProperties": false
+    },
+    "agent": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "表示名",
+          "type": "string",
+          "minLength": 1
+        },
+        "bot": { "$ref": "#/$defs/bot" },
+        "workflow": {
+          "description": "エージェントを動かすワークフローのファイル名",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+\\.ya?ml$"
+        },
+        "appClientId": { "$ref": "#/$defs/appClientId" },
+        "fix": {
+          "description": "このエージェントが作った PR を修正するときのモデルと effort (どの段階でも同じ)",
+          "$ref": "#/$defs/execution"
+        }
+      },
+      "required": ["name", "bot", "workflow", "appClientId"],
+      "additionalProperties": false
+    }
+  }
+}

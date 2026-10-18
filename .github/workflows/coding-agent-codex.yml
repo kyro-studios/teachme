@@ -1,0 +1,503 @@
+name: Coding Agent (Codex)
+
+# 振り分け用のワークフローが、作成、修正、レビューの依頼ごとに手動実行 (workflow_dispatch) する。
+# 入力の形式は、すべてのエージェントのワークフローで共通にしている (仕様の 2.2)。
+# モデルと effort は依頼に含まれる値をそのまま使い、このワークフローには書かない (agents.json で決める)。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 依頼の種類 (create、fix、review)
+        type: string
+        required: true
+      stage:
+        description: 段階
+        type: string
+        required: true
+      issue-number:
+        description: 対象の Issue の番号
+        type: string
+        required: true
+      pull-request-number:
+        description: 対象の PR の番号 (作成のときは空)
+        type: string
+        required: false
+        default: ''
+      target-sha:
+        description: 作業を始めるコミット (修正やレビューのときは、PR の head)
+        type: string
+        required: true
+      request-run-id:
+        description: 依頼の Artifact を保存した、振り分け用のワークフローの実行の ID
+        type: string
+        required: true
+      request-id:
+        description: 依頼の識別子 (Artifact の中のファイル名)
+        type: string
+        required: true
+
+permissions: {}
+
+# 同じ PR のレビューは、新しい依頼が来たら古いものを取り消し、最新のコミットだけをレビューする。
+# 作成と修正は、同じ Issue や PR への作業を 1 つずつ行う (作業の途中で取り消さない)
+concurrency:
+  group: coding-agent-codex-${{ inputs.mode == 'review' && 'review' || 'work' }}-${{ inputs.pull-request-number || inputs.issue-number }}
+  cancel-in-progress: ${{ inputs.mode == 'review' }}
+
+jobs:
+  work:
+    name: Codex による作業
+    if: vars.CODING_AGENT_ENABLED == 'true' && (inputs.mode == 'create' || inputs.mode == 'fix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # 作成担当には書き込み権限を持つトークンを渡さない (push と PR の作成は publish ジョブが行う)
+    permissions:
+      contents: read
+      # 依頼の Artifact を、振り分け用のワークフローの実行から取得する
+      actions: read
+    outputs:
+      agent: ${{ steps.request.outputs.agent }}
+      kind: ${{ steps.request.outputs.kind }}
+      merge-sha: ${{ steps.request.outputs.merge-sha }}
+      criteria-failed: ${{ steps.criteria.outputs.failed }}
+    steps:
+      - name: 作業を始めるコミットをチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target-sha }}
+          # 修正では、コンフリクトの解消のために既定ブランチを取り込むことがあるため、履歴をすべて取得する
+          fetch-depth: ${{ inputs.mode == 'fix' && '0' || '1' }}
+          persist-credentials: false
+
+      # 指示やスクリプトは既定ブランチのものを使い、作業ディレクトリの外に置く (変更内容に含めないため)
+      - name: 既定ブランチの仕組みをチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          path: coding-agent-trusted
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: 既定ブランチの仕組みを作業ディレクトリの外に移す
+        run: mv coding-agent-trusted "$RUNNER_TEMP/trusted"
+
+      - name: 依頼を取得する
+        uses: actions/download-artifact@v8
+        with:
+          name: coding-agent-requests
+          run-id: ${{ inputs.request-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/coding-agent-requests
+
+      - name: 依頼の内容を確かめる
+        id: request
+        env:
+          REQUEST_ID: ${{ inputs.request-id }}
+          MODE: ${{ inputs.mode }}
+          TARGET_SHA: ${{ inputs.target-sha }}
+          REQUEST_DIR: ${{ runner.temp }}/coding-agent-requests
+          TRUSTED: ${{ runner.temp }}/trusted
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUEST_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::依頼の識別子の形式が正しくありません: $REQUEST_ID"
+            exit 1
+          fi
+          request="$REQUEST_DIR/$REQUEST_ID.json"
+          if [ "$(jq -r '.mode' "$request")" != "$MODE" ] || [ "$(jq -r '.targetSha' "$request")" != "$TARGET_SHA" ]; then
+            echo "::error::依頼の内容が、ワークフローの入力と一致しません"
+            exit 1
+          fi
+          echo "agent=$(jq -r '.agent' "$request")" >> "$GITHUB_OUTPUT"
+          # コンフリクトの修正では、取り込む既定ブランチのコミットが依頼に含まれる
+          merge_sha="$(jq -r '.materials.conflict.baseSha // ""' "$request")"
+          if [ -n "$merge_sha" ] && [[ ! "$merge_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::取り込むコミットの SHA が正しくありません: $merge_sha"
+            exit 1
+          fi
+          echo "merge-sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          echo "model=$(jq -r '.execution.model // ""' "$request")" >> "$GITHUB_OUTPUT"
+          echo "effort=$(jq -r '.execution.effort // ""' "$request")" >> "$GITHUB_OUTPUT"
+          # 実装計画は、ファイルを変更せずに計画を出力する。文書の段階は、作業ディレクトリのファイルだけを変更する
+          case "$(jq -r '.stage' "$request")" in
+            planning)
+              echo "kind=planning" >> "$GITHUB_OUTPUT"
+              echo "permission-profile=:read-only" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$TRUSTED/.github/coding-agent/plan-schema.json" >> "$GITHUB_OUTPUT"
+              ;;
+            implementation|project)
+              # コードを変える段階には、ネットワークや Docker を使える権限の設計が別に必要なため、まだ対応していない
+              echo "::error::Codex によるコードを変える段階 (プロジェクトの作成と実装タスク) には、まだ対応していません (agents.json の roles.project.author と roles.implementation.implementers を見直してください)"
+              exit 1
+              ;;
+            specification)
+              # 仕様書の段階では、作成と修正のどちらでも、受け入れ基準も出力する (仕様の 10.2)
+              echo "kind=change" >> "$GITHUB_OUTPUT"
+              echo "acceptance-criteria=true" >> "$GITHUB_OUTPUT"
+              echo "permission-profile=:workspace" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$TRUSTED/.github/coding-agent/specification-result-schema.json" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "kind=change" >> "$GITHUB_OUTPUT"
+              echo "permission-profile=:workspace" >> "$GITHUB_OUTPUT"
+              echo "output-schema=$TRUSTED/.github/coding-agent/result-schema.json" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      # コンフリクトの修正では、既定ブランチのコミットを取り込み (コミットはしない)、コンフリクトの印をエージェントに解消させる
+      - name: 既定ブランチを取り込む
+        if: steps.request.outputs.merge-sha != ''
+        env:
+          MERGE_SHA: ${{ steps.request.outputs.merge-sha }}
+        run: |
+          set -euo pipefail
+          git config user.name coding-agent
+          git config user.email coding-agent@users.noreply.github.com
+          # チェックアウトで SHA を指定すると、そのコミットの履歴しか取得しないため、取り込むコミットを取得する
+          git fetch --no-tags origin "$MERGE_SHA"
+          # コンフリクトしても止めない。取り込みの途中の状態 (MERGE_HEAD) になっていることだけを確かめる
+          git merge --no-ff --no-commit "$MERGE_SHA" || true
+          if ! git rev-parse -q --verify MERGE_HEAD > /dev/null; then
+            echo "::error::既定ブランチのコミット $MERGE_SHA を取り込めませんでした"
+            exit 1
+          fi
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+          echo "コンフリクトしたファイル:"
+          cat "$RUNNER_TEMP/conflicts.txt"
+
+      - name: 作業の指示を作る
+        env:
+          REQUEST_FILE: ${{ runner.temp }}/coding-agent-requests/${{ inputs.request-id }}.json
+          TRUSTED: ${{ runner.temp }}/trusted
+          MERGE_SHA: ${{ steps.request.outputs.merge-sha }}
+        run: |
+          set -euo pipefail
+          node "$TRUSTED/.github/scripts/coding-agent/author-prompt.mjs" \
+            --request "$REQUEST_FILE" \
+            --prompts "$TRUSTED/.github/coding-agent/prompts" \
+            --prompt-out "$RUNNER_TEMP/author-prompt.md" \
+            ${MERGE_SHA:+--conflicts "$RUNNER_TEMP/conflicts.txt"}
+
+      # Codex は bubblewrap で、書き込める場所とネットワークを制限する (permission-profile)
+      - name: Codex を隔離する bubblewrap を用意する
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          # Ubuntu 24.04 以降では、AppArmor の既定の設定で、bubblewrap がユーザー名前空間を作れない。
+          # 制限が有効なときだけ、bubblewrap 自体に許可を与える (bubblewrap の中で動くコマンドには与えない)
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = '1' ]; then
+            sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+            sudo systemctl reload apparmor
+          fi
+          bwrap --ro-bind / / --unshare-pid true
+          echo "bubblewrap を使えることを確かめました"
+
+      - name: Codex で作業する
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ runner.temp }}/author-prompt.md
+          permission-profile: ${{ steps.request.outputs.permission-profile }}
+          output-schema-file: ${{ steps.request.outputs.output-schema }}
+          output-file: ${{ runner.temp }}/coding-agent-output.json
+          model: ${{ steps.request.outputs.model }}
+          effort: ${{ steps.request.outputs.effort }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allow-bots: true
+
+      - name: 計画をまとめる
+        if: steps.request.outputs.kind == 'planning'
+        env:
+          OUTPUT_FILE: ${{ runner.temp }}/coding-agent-output.json
+          PLAN_DIR: ${{ runner.temp }}/coding-agent-plan
+        run: |
+          set -euo pipefail
+          if [ ! -s "$OUTPUT_FILE" ]; then
+            echo "::error::作成担当が計画を出力しませんでした"
+            exit 1
+          fi
+          mkdir -p "$PLAN_DIR"
+          cp "$OUTPUT_FILE" "$PLAN_DIR/plan.json"
+          jq . "$PLAN_DIR/plan.json"
+
+      - name: 計画を保存する
+        if: steps.request.outputs.kind == 'planning'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-plan
+          path: ${{ runner.temp }}/coding-agent-plan
+          retention-days: 30
+
+      # Markdown の見出しの下線 (=======) と区別するため、始まりと終わりの印だけを確かめる
+      - name: コンフリクトの印が残っていないか確かめる
+        if: steps.request.outputs.merge-sha != ''
+        run: |
+          set -euo pipefail
+          remaining=()
+          while IFS= read -r file; do
+            if [ -n "$file" ] && [ -f "$file" ] && grep -qE '^(<<<<<<<|>>>>>>>)( |$)' "$file"; then
+              remaining+=("$file")
+            fi
+          done < "$RUNNER_TEMP/conflicts.txt"
+          if [ "${#remaining[@]}" -gt 0 ]; then
+            echo "::error::コンフリクトの印が残っています: ${remaining[*]}"
+            exit 1
+          fi
+
+      # 仕様書の段階では、エージェントの出力から、受け入れ基準のファイルを作る (仕様の 10.2)。
+      # Schema での検証 (Ajv) に要るため、既定ブランチの仕組みの依存パッケージを、エージェントの作業の後にインストールする
+      - name: 受け入れ基準のファイルを作る
+        id: criteria
+        if: steps.request.outputs.acceptance-criteria == 'true'
+        env:
+          REQUEST_FILE: ${{ runner.temp }}/coding-agent-requests/${{ inputs.request-id }}.json
+          TRUSTED: ${{ runner.temp }}/trusted
+          TARGET_SHA: ${{ inputs.target-sha }}
+          OUTPUT_FILE: ${{ runner.temp }}/coding-agent-output.json
+        run: |
+          set -euo pipefail
+          (cd "$TRUSTED" && npm ci --ignore-scripts --no-audit --no-fund)
+          if ! node "$TRUSTED/.github/scripts/coding-agent/acceptance-criteria.mjs" \
+            --request "$REQUEST_FILE" \
+            --output "$OUTPUT_FILE" \
+            --base-sha "$TARGET_SHA"; then
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::エージェントが出力した受け入れ基準を検証できませんでした。変更を取り込まずに、人に引き継ぎます"
+          fi
+
+      - name: 変更内容をまとめる
+        if: steps.request.outputs.kind == 'change' && steps.criteria.outputs.failed != 'true'
+        env:
+          TARGET_SHA: ${{ inputs.target-sha }}
+          OUTPUT_FILE: ${{ runner.temp }}/coding-agent-output.json
+          RESULT_DIR: ${{ runner.temp }}/coding-agent-result
+        run: |
+          set -euo pipefail
+          mkdir -p "$RESULT_DIR"
+          if [ -f "$OUTPUT_FILE" ]; then
+            cp "$OUTPUT_FILE" "$RESULT_DIR/result.json"
+          fi
+          # エージェントが指示に反してコミットしていても漏れないよう、作業を始めたコミットと比較する
+          git add --all
+          git diff --cached --binary "$TARGET_SHA" > "$RESULT_DIR/changes.patch"
+          git diff --cached --stat "$TARGET_SHA"
+
+      - name: 変更内容を保存する
+        if: steps.request.outputs.kind == 'change' && steps.criteria.outputs.failed != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-result
+          path: ${{ runner.temp }}/coding-agent-result
+          retention-days: 7
+
+  publish:
+    needs: work
+    # 受け入れ基準を作れなかった変更は取り込まない (人への引き継ぎは hand-over ジョブが行う)
+    if: needs.work.outputs.kind == 'change' && needs.work.outputs.criteria-failed != 'true'
+    uses: ./.github/workflows/coding-agent-publish.yml
+    permissions:
+      contents: read
+    with:
+      agent: ${{ needs.work.outputs.agent }}
+      mode: ${{ inputs.mode }}
+      issue-number: ${{ inputs.issue-number }}
+      pull-request-number: ${{ inputs.pull-request-number }}
+      target-sha: ${{ inputs.target-sha }}
+      artifact-name: coding-agent-result
+      merge-sha: ${{ needs.work.outputs.merge-sha }}
+    secrets:
+      # Organization か利用するリポジトリの Secrets に登録した、Codex 用の App の秘密鍵
+      app-private-key: ${{ secrets.CODING_AGENT_CODEX_PRIVATE_KEY }}
+
+  # 受け入れ基準のファイルを作れなかったら (仕様の 10.2)、振り分け用のワークフローを手動実行し、進行役の App で人に引き継ぐ。
+  # このワークフローは進行役の App の秘密鍵を持たないため、needs-human ラベルを付けるのは振り分け用のワークフローが行う
+  hand-over:
+    name: 人への引き継ぎ
+    needs: work
+    if: needs.work.outputs.criteria-failed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: 振り分け用のワークフローに、人への引き継ぎを依頼する
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # 作成のときは段階の Issue に、修正のときは PR に引き継ぐ
+          NUMBER: ${{ inputs.mode == 'fix' && inputs.pull-request-number || inputs.issue-number }}
+        run: |
+          set -euo pipefail
+          gh workflow run coding-agent-router.yml -R "$GITHUB_REPOSITORY" \
+            -f issue-number="$NUMBER" \
+            -f hand-over=acceptance-criteria \
+            -f source-run-id="$GITHUB_RUN_ID"
+          echo "::error::変更を取り込まずに、#$NUMBER を人に引き継ぎました (acceptance-criteria)"
+          exit 1
+
+  # 実装計画では、計画から進行役の App で実装タスクの Issue を作る
+  tasks:
+    needs: work
+    if: needs.work.outputs.kind == 'planning'
+    uses: ./.github/workflows/coding-agent-tasks.yml
+    permissions:
+      contents: read
+    with:
+      planning-issue-number: ${{ inputs.issue-number }}
+      artifact-name: coding-agent-plan
+    secrets:
+      # Organization か利用するリポジトリの Secrets に登録した、進行役の App の秘密鍵
+      coordinator-private-key: ${{ secrets.CODING_AGENT_COORDINATOR_PRIVATE_KEY }}
+
+  review:
+    name: Codex によるレビュー
+    if: vars.CODING_AGENT_ENABLED == 'true' && inputs.mode == 'review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # レビュー担当には書き込み権限を持つトークンを渡さない (レビューの投稿とマージは publish-review ジョブが行う)
+    permissions:
+      contents: read
+      # 依頼の Artifact を、振り分け用のワークフローの実行から取得する
+      actions: read
+    outputs:
+      agent: ${{ steps.request.outputs.agent }}
+    steps:
+      # 指示やスクリプトは、PR の変更で書き換えられないよう、既定ブランチのものを使う
+      - name: 既定ブランチの仕組みをチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          path: trusted
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: レビューする PR をチェックアウトする
+        uses: actions/checkout@v7
+        with:
+          path: pull-request
+          ref: ${{ inputs.target-sha }}
+          # 依頼に含まれる PR のベースとの差分を確かめられるようにする
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 依頼を取得する
+        uses: actions/download-artifact@v8
+        with:
+          name: coding-agent-requests
+          run-id: ${{ inputs.request-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/coding-agent-requests
+
+      - name: 依頼の内容を確かめる
+        id: request
+        env:
+          REQUEST_ID: ${{ inputs.request-id }}
+          TARGET_SHA: ${{ inputs.target-sha }}
+          REQUEST_DIR: ${{ runner.temp }}/coding-agent-requests
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUEST_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::依頼の識別子の形式が正しくありません: $REQUEST_ID"
+            exit 1
+          fi
+          request="$REQUEST_DIR/$REQUEST_ID.json"
+          if [ "$(jq -r '.mode' "$request")" != 'review' ] || [ "$(jq -r '.targetSha' "$request")" != "$TARGET_SHA" ]; then
+            echo "::error::依頼の内容が、ワークフローの入力と一致しません"
+            exit 1
+          fi
+          echo "agent=$(jq -r '.agent' "$request")" >> "$GITHUB_OUTPUT"
+          echo "model=$(jq -r '.execution.model // ""' "$request")" >> "$GITHUB_OUTPUT"
+          echo "effort=$(jq -r '.execution.effort // ""' "$request")" >> "$GITHUB_OUTPUT"
+
+      - name: レビューの指示を作る
+        id: prompt
+        env:
+          REQUEST_FILE: ${{ runner.temp }}/coding-agent-requests/${{ inputs.request-id }}.json
+          REVIEW_DIR: ${{ runner.temp }}/coding-agent-review
+        run: |
+          set -euo pipefail
+          mkdir -p "$REVIEW_DIR"
+          node trusted/.github/scripts/coding-agent/review-prompt.mjs \
+            --request "$REQUEST_FILE" \
+            --prompts trusted/.github/coding-agent/prompts/review \
+            --prompt-out "$REVIEW_DIR/prompt.md" \
+            --review-out "$REVIEW_DIR/review.json" \
+            --workspace pull-request
+          if [ -f "$REVIEW_DIR/prompt.md" ]; then
+            delimiter="PROMPT_$(openssl rand -hex 16)"
+            {
+              echo "prompt<<$delimiter"
+              cat "$REVIEW_DIR/prompt.md"
+              echo "$delimiter"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      # Codex は bubblewrap で、書き込める場所とネットワークを制限する (permission-profile)
+      - name: Codex を隔離する bubblewrap を用意する
+        if: steps.prompt.outputs.skip-review != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          # Ubuntu 24.04 以降では、AppArmor の既定の設定で、bubblewrap がユーザー名前空間を作れない。
+          # 制限が有効なときだけ、bubblewrap 自体に許可を与える (bubblewrap の中で動くコマンドには与えない)
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = '1' ]; then
+            sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          EOF
+            sudo systemctl reload apparmor
+          fi
+          bwrap --ro-bind / / --unshare-pid true
+          echo "bubblewrap を使えることを確かめました"
+
+      # 変更してよい範囲の外にあるファイルが変更されていれば、Codex を呼ばずに差し戻す (review.json は作成済み)
+      - name: Codex でレビューする
+        if: steps.prompt.outputs.skip-review != 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          working-directory: pull-request
+          # ファイルの編集やネットワークへの接続をさせず、読むことだけを許可する
+          permission-profile: ':read-only'
+          output-schema-file: ${{ github.workspace }}/trusted/.github/coding-agent/review-schema.json
+          output-file: ${{ runner.temp }}/coding-agent-review/review.json
+          model: ${{ steps.request.outputs.model }}
+          effort: ${{ steps.request.outputs.effort }}
+          # 振り分け用のワークフロー (github-actions[bot]) からの手動実行を許可する
+          allow-bots: true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coding-agent-review
+          path: ${{ runner.temp }}/coding-agent-review/review.json
+          retention-days: 7
+
+  publish-review:
+    needs: review
+    uses: ./.github/workflows/coding-agent-publish-review.yml
+    permissions:
+      contents: read
+      # 差し戻したら、振り分け用のワークフローを手動実行して修正を依頼する
+      actions: write
+    with:
+      agent: ${{ needs.review.outputs.agent }}
+      stage: ${{ inputs.stage }}
+      pull-request-number: ${{ inputs.pull-request-number }}
+      target-sha: ${{ inputs.target-sha }}
+      artifact-name: coding-agent-review
+    secrets:
+      # Organization か利用するリポジトリの Secrets に登録した、Codex 用の App の秘密鍵
+      app-private-key: ${{ secrets.CODING_AGENT_CODEX_PRIVATE_KEY }}

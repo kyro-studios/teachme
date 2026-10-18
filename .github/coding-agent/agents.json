@@ -1,0 +1,51 @@
+{
+  "$schema": "./agents-schema.json",
+  "coordinator": {
+    "bot": "your-coordinator-app[bot]",
+    "appClientId": "your-coordinator-app-client-id"
+  },
+  "agents": {
+    "claude": {
+      "name": "Claude Code",
+      "bot": "your-claude-app[bot]",
+      "workflow": "coding-agent-claude.yml",
+      "appClientId": "your-claude-app-client-id",
+      "fix": { "model": "claude-haiku-5-5", "effort": "low" }
+    },
+    "codex": {
+      "name": "Codex",
+      "bot": "your-codex-app[bot]",
+      "workflow": "coding-agent-codex.yml",
+      "appClientId": "your-codex-app-client-id",
+      "fix": { "model": "gpt-6-luna", "effort": "low" }
+    }
+  },
+  "roles": {
+    "requirements": {
+      "reviewer": { "agent": "codex", "model": "gpt-6-luna", "effort": "medium" }
+    },
+    "specification": {
+      "author": { "agent": "claude", "model": "claude-haiku-5-5", "effort": "high" },
+      "reviewer": { "agent": "codex", "model": "gpt-6.1-sol", "effort": "medium" }
+    },
+    "domain-model": {
+      "author": { "agent": "codex", "model": "gpt-6.1-sol", "effort": "high" },
+      "reviewer": { "agent": "claude", "model": "claude-haiku-5-5", "effort": "medium" }
+    },
+    "architecture": {
+      "author": { "agent": "claude", "model": "claude-sonnet-5-5", "effort": "medium" },
+      "reviewer": { "agent": "codex", "model": "gpt-6.1-sol", "effort": "medium" }
+    },
+    "project": {
+      "author": { "agent": "claude", "model": "claude-sonnet-5-5", "effort": "medium" },
+      "reviewer": { "agent": "codex", "model": "gpt-6-luna", "effort": "medium" }
+    },
+    "planning": {
+      "author": { "agent": "claude", "model": "claude-sonnet-5-5", "effort": "medium" }
+    },
+    "implementation": {
+      "implementers": [{ "agent": "claude", "model": "claude-haiku-5-5", "effort": "high" }],
+      "reviewer": { "agent": "codex", "model": "gpt-6.1-sol", "effort": "medium" }
+    }
+  }
+}
