@@ -6,7 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.teachme.ai.AiCallKind;
+import com.teachme.ai.AiFailedException;
 import com.teachme.ai.ScriptedResponse;
+import com.teachme.ai.SpeechToText;
 import com.teachme.ai.fake.FakeAi;
 import com.teachme.application.DialogueService.Recording;
 import com.teachme.application.DialogueService.ReplyTicket;
@@ -17,7 +19,9 @@ import com.teachme.domain.Speaker;
 import com.teachme.domain.StudentType;
 import com.teachme.domain.Subject;
 import com.teachme.domain.UnitName;
+import com.teachme.persistence.DialogueRepository;
 import com.teachme.persistence.DialogueRepository.NewTurn;
+import com.teachme.persistence.DialogueRepository.RecordedReply;
 import com.teachme.persistence.Repositories;
 import com.teachme.testsupport.DialogueFixtures;
 import com.teachme.testsupport.Fixtures;
@@ -45,6 +49,8 @@ class DialogueServiceTest {
   private DataSource dataSource;
   private FakeAi fakeAi;
   private MutableClock clock;
+  private SettingsService settings;
+  private DialogueRepository dialogues;
   private DialogueService dialogue;
   private UUID materialId;
 
@@ -53,9 +59,10 @@ class DialogueServiceTest {
     dataSource = Fixtures.freshDataSource();
     Repositories repositories = new Repositories(dataSource);
     clock = new MutableClock(START, Fixtures.JAPAN);
-    SettingsService settings = new SettingsService(repositories.settings(), clock);
+    settings = new SettingsService(repositories.settings(), clock);
+    dialogues = repositories.dialogues();
     fakeAi = new FakeAi();
-    dialogue = new DialogueService(settings, repositories.dialogues(), fakeAi, fakeAi, clock);
+    dialogue = new DialogueService(settings, dialogues, fakeAi, fakeAi, clock);
     completeSetup(settings, USER, "二次関数");
     completeSetup(settings, OTHER, "三角比");
     UUID unitId = settings.find(USER).orElseThrow().unitId();
@@ -121,12 +128,12 @@ class DialogueServiceTest {
     UUID firstId = utter(lessonId);
 
     try (ReplyTicket ticket = dialogue.beginReply(DialogueKind.LESSON, USER, lessonId, firstId)) {
-      int rounds =
+      RecordedReply reply =
           dialogue.commitReply(
               ticket,
               new NewTurn(Speaker.STUDENT, "なるほど", "normal", null),
               Optional.of(new Degrees(List.of(1, 0, 2))));
-      assertEquals(1, rounds);
+      assertEquals(1, reply.roundCount());
     }
     ConflictException replied =
         assertThrows(
@@ -272,10 +279,10 @@ class DialogueServiceTest {
         dialogue.beginReply(DialogueKind.LESSON, USER, lessonId, utteranceId)) {
       clock.advance(Duration.ofSeconds(601));
 
-      int rounds =
+      RecordedReply reply =
           dialogue.commitReply(
               ticket, new NewTurn(Speaker.STUDENT, "なるほど", "normal", null), Optional.empty());
-      assertEquals(1, rounds);
+      assertEquals(1, reply.roundCount());
     }
     assertEquals(1, DialogueFixtures.lessonRoundCount(dataSource, lessonId));
   }
@@ -334,6 +341,41 @@ class DialogueServiceTest {
   }
 
   @Test
+  void STT_の最中に授業が消えていれば_認識結果が空でも_404_になる() {
+    UUID lessonId = startLesson(0);
+    DialogueService service =
+        serviceWith(
+            (context, recording) -> {
+              DialogueFixtures.deleteLesson(dataSource, lessonId);
+              return " ";
+            });
+
+    assertThrows(
+        NotFoundException.class,
+        () -> service.acceptUtterance(DialogueKind.LESSON, USER, lessonId, RECORDING));
+  }
+
+  @Test
+  void STT_の最中に授業が消えていれば_認識の失敗でも_404_になる() {
+    UUID lessonId = startLesson(0);
+    DialogueService service =
+        serviceWith(
+            (context, recording) -> {
+              DialogueFixtures.deleteLesson(dataSource, lessonId);
+              throw new AiFailedException(AiCallKind.STT);
+            });
+
+    assertThrows(
+        NotFoundException.class,
+        () -> service.acceptUtterance(DialogueKind.LESSON, USER, lessonId, RECORDING));
+  }
+
+  /** 音声認識の部品だけを差し替えた、同じ依存を持つ共通部品。 */
+  private DialogueService serviceWith(SpeechToText speechToText) {
+    return new DialogueService(settings, dialogues, speechToText, fakeAi, clock);
+  }
+
+  @Test
   void 認識の失敗は_認識できなかったものとして_空を返し_印を残さない() {
     UUID lessonId = startLesson(0);
     fakeAi.script(USER, AiCallKind.STT, List.of(new ScriptedResponse(false, null)), false);
@@ -347,12 +389,16 @@ class DialogueServiceTest {
   void 音声は字幕_1_件につき_1_回だけ生成し_二度目以降は保存したものを返す() {
     UUID lessonId = startLesson(0);
     UUID utteranceId = utter(lessonId);
+    UUID studentTurnId;
     try (ReplyTicket ticket =
         dialogue.beginReply(DialogueKind.LESSON, USER, lessonId, utteranceId)) {
-      dialogue.commitReply(
-          ticket, new NewTurn(Speaker.STUDENT, "なるほど", "normal", null), Optional.empty());
+      studentTurnId =
+          dialogue
+              .commitReply(
+                  ticket, new NewTurn(Speaker.STUDENT, "なるほど", "normal", null), Optional.empty())
+              .turnId();
     }
-    UUID studentTurnId = DialogueFixtures.turnIdOf(dataSource, lessonId, "student");
+    assertEquals(DialogueFixtures.turnIdOf(dataSource, lessonId, "student"), studentTurnId);
 
     byte[] first = dialogue.synthesizeAudio(DialogueKind.LESSON, USER, lessonId, studentTurnId);
     byte[] second = dialogue.synthesizeAudio(DialogueKind.LESSON, USER, lessonId, studentTurnId);

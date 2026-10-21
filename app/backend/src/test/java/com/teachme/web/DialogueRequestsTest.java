@@ -42,11 +42,30 @@ class DialogueRequestsTest {
       };
 
   @Test
-  void 形式が申告されなければ_octet_stream_として受け取る() throws Exception {
+  void 形式が申告されなければ_invalid_audio_になる() throws Exception {
     HttpResponse<String> response = post("/api/recording", new byte[] {1}, null);
 
+    assertEquals(400, response.statusCode());
+    assertEquals("invalid_audio", json(response).get("error").get("code").asText());
+  }
+
+  @Test
+  void 受け付けない形式の録音は_invalid_audio_になる() throws Exception {
+    for (String contentType : List.of("application/octet-stream", "image/png", "audio/ogg")) {
+      HttpResponse<String> response = post("/api/recording", new byte[] {1}, contentType);
+
+      assertEquals(400, response.statusCode(), contentType);
+      assertEquals("invalid_audio", json(response).get("error").get("code").asText());
+    }
+  }
+
+  @Test
+  void 付属の部分が付いた形式は_本体で比べて受け取る() throws Exception {
+    HttpResponse<String> response =
+        post("/api/recording", new byte[] {1, 2}, "Audio/WebM; codecs=opus");
+
     assertEquals(200, response.statusCode());
-    assertEquals("application/octet-stream 1", response.body());
+    assertEquals("audio/webm 2", response.body());
   }
 
   @Test

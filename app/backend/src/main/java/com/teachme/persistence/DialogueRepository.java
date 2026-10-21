@@ -52,6 +52,14 @@ public final class DialogueRepository {
       Speaker speaker, String body, boolean replied, boolean audioAttempted, byte[] audio) {}
 
   /**
+   * 確定した応答の結果。
+   *
+   * @param turnId 入れた応答の字幕の識別子。API の `turn.turnId` と音声の取得に使う
+   * @param roundCount 増やした後の往復の数
+   */
+  public record RecordedReply(UUID turnId, int roundCount) {}
+
+  /**
    * 字幕に入れる内容。
    *
    * @param expression 生徒や先輩先生の表情。無ければ null
@@ -167,11 +175,11 @@ public final class DialogueRepository {
    * 応答を確定する。利用者の字幕を応答済みにし、応答の字幕を入れ、往復を 1 つ増やす。`evaluated` があれば、度合いを最大値で取り込む (授業のみ)。
    *
    * @param utteranceId 応答の対象の、利用者の字幕。処理中の印の下で、未応答であることを前提とする
-   * @return 増やした後の往復の数。親の行が無ければ (中断された後なら) 何もせず空
+   * @return 入れた応答の字幕の識別子と、増やした後の往復の数。親の行が無ければ (中断された後なら) 何もせず空
    * @throws IllegalStateException 対象の字幕が未応答の利用者の字幕として見つからないとき (処理中の印の不整合)
    * @throws IllegalArgumentException 相談に度合いを渡したとき
    */
-  public Optional<Integer> recordReply(
+  public Optional<RecordedReply> recordReply(
       DialogueKind kind,
       UUID userId,
       UUID parentId,
@@ -199,7 +207,8 @@ public final class DialogueRepository {
           if (replied != 1) {
             throw new IllegalStateException("未応答の発話が見つからない (処理中の印の不整合)");
           }
-          insertTurn(in, parent, parentId, UUID.randomUUID(), reply);
+          UUID turnId = UUID.randomUUID();
+          insertTurn(in, parent, parentId, turnId, reply);
           if (evaluated.isPresent()) {
             mergeDegrees(in, parentId, evaluated.get());
           }
@@ -210,7 +219,7 @@ public final class DialogueRepository {
                   .returningResult(parent.roundCount())
                   .fetchSingle()
                   .value1();
-          return Optional.of(roundCount.intValue());
+          return Optional.of(new RecordedReply(turnId, roundCount.intValue()));
         });
   }
 

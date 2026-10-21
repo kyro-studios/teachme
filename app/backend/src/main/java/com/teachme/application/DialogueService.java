@@ -13,6 +13,7 @@ import com.teachme.domain.Speaker;
 import com.teachme.persistence.DialogueRepository;
 import com.teachme.persistence.DialogueRepository.NewTurn;
 import com.teachme.persistence.DialogueRepository.ParentState;
+import com.teachme.persistence.DialogueRepository.RecordedReply;
 import com.teachme.persistence.DialogueRepository.TurnRow;
 import java.time.Clock;
 import java.time.Duration;
@@ -98,7 +99,7 @@ public final class DialogueService {
    * 録音を文章にし、認識できたら利用者の字幕として入れる。応答は作らない。
    *
    * <p>往復か期限に達していれば、STT を呼ばずに、録音を捨てて 409 `limit_reached` を返す。STT の失敗と、認識結果が空のときは、何も入れず、空を返す
-   * (往復にも数えない)。
+   * (往復にも数えない)。どちらの場合も、STT の後に親の行が無ければ 404 を返す。
    *
    * @return 認識できたときの字幕。認識できなかったとき空
    * @throws ConflictException 設定が未完了、個人情報の確認が無い、処理中、往復か期限に達している
@@ -112,6 +113,7 @@ public final class DialogueService {
       checkLimit(kind, requireParent(kind, userId, parentId));
       String text = recognize(userId, recording);
       if (text.isEmpty()) {
+        requireParent(kind, userId, parentId);
         return Optional.empty();
       }
       UUID utteranceId =
@@ -162,10 +164,10 @@ public final class DialogueService {
    * <p>LLM の呼び出しの後に行う。親の行が無ければ (中断された後なら) 結果を捨てて 404 を返す。確定の後も印は残るため、呼び出し側は {@link ReplyTicket}
    * を閉じる。
    *
-   * @return 増やした後の往復の数
+   * @return 入れた応答の字幕の識別子 (API の `turn.turnId`、音声の取得に使う) と、増やした後の往復の数
    * @throws NotFoundException 親の行が無い
    */
-  public int commitReply(ReplyTicket ticket, NewTurn reply, Optional<Degrees> evaluated) {
+  public RecordedReply commitReply(ReplyTicket ticket, NewTurn reply, Optional<Degrees> evaluated) {
     ticket.requireOpen();
     return dialogues
         .recordReply(
