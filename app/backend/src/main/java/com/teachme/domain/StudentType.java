@@ -1,5 +1,8 @@
 package com.teachme.domain;
 
+import java.util.Arrays;
+import java.util.Optional;
+
 /**
  * AI 生徒の種類 (仕様書 1.3)。表示名、初期偏差値、目標偏差値、性格 (応答の方針)。
  *
@@ -27,6 +30,11 @@ public enum StudentType {
     this.initialDeviation = initialDeviation;
     this.targetDeviation = targetDeviation;
     this.personality = personality;
+  }
+
+  /** 識別子から種類を求める。知らない識別子なら空。 */
+  public static Optional<StudentType> fromId(String id) {
+    return Arrays.stream(values()).filter(type -> type.id.equals(id)).findFirst();
   }
 
   public String id() {
