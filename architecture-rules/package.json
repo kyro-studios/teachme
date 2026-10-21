@@ -1,0 +1,9 @@
+{
+  "name": "architecture-rules",
+  "private": true,
+  "description": "モジュール間の依存のルール (TypeScript は dependency-cruiser、Java は archunit/)",
+  "devDependencies": {
+    "dependency-cruiser": "^18.7.0",
+    "typescript": "~5.9.3"
+  }
+}
