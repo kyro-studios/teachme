@@ -39,6 +39,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import javax.imageio.ImageIO;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -426,6 +427,22 @@ class OpenAiLanguageModelTest {
                 .studentReply(context(AiCallKind.STUDENT_REPLY), studentReplyInput("u")));
 
     assertEquals(1, stub.requests().size());
+    assertLogged("student_reply", "dialogue-model", "failure", " reason=timeout");
+  }
+
+  @Test
+  void 本文の受信が遅く_タイムアウトしたら_期限で止めて失敗とする() {
+    // ヘッダーは届くが、本文が 3 秒後まで届かない
+    stub.enqueue(new Reply(200, OpenAiStub.completion(STUDENT_JSON, null), 0, 3_000));
+    OpenAiLanguageModel model = model(Duration.ofMillis(300), LONG);
+
+    long started = System.nanoTime();
+    assertThrows(
+        AiFailedException.class,
+        () -> model.studentReply(context(AiCallKind.STUDENT_REPLY), studentReplyInput("u")));
+    long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+
+    assertTrue(elapsedMillis < 2_000, "本文の待ちが期限で止まっていません: " + elapsedMillis + " ms");
     assertLogged("student_reply", "dialogue-model", "failure", " reason=timeout");
   }
 

@@ -33,9 +33,15 @@ final class OpenAiStub implements AutoCloseable {
   /**
    * 次の応答。
    *
-   * @param delayMillis 応答を返すまでの待ち時間 (タイムアウトの試験に使う)
+   * @param delayMillis ヘッダーを返すまでの待ち時間 (タイムアウトの試験に使う)
+   * @param bodyDelayMillis ヘッダーを返した後、本文を返すまでの待ち時間 (本文の遅れの試験に使う)
    */
-  record Reply(int status, String body, long delayMillis) {}
+  record Reply(int status, String body, long delayMillis, long bodyDelayMillis) {
+
+    Reply(int status, String body, long delayMillis) {
+      this(status, body, delayMillis, 0);
+    }
+  }
 
   private final HttpServer server;
   private final List<Recorded> requests = new CopyOnWriteArrayList<>();
@@ -97,6 +103,8 @@ final class OpenAiStub implements AutoCloseable {
     exchange.sendResponseHeaders(reply.status(), bytes.length);
     // 相手が待ちきれずに切ったときは、書けなくてもよい
     try (OutputStream out = exchange.getResponseBody()) {
+      out.flush();
+      sleep(reply.bodyDelayMillis());
       out.write(bytes);
     } catch (IOException ignored) {
       // 応答を書けなかったことは、テストの判定に関係しない

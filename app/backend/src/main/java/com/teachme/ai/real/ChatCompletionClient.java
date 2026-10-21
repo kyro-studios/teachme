@@ -18,7 +18,10 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -103,9 +106,7 @@ final class ChatCompletionClient {
     long started = System.nanoTime();
     HttpResponse<String> response;
     try {
-      response =
-          http.send(
-              httpRequest(request), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+      response = send(request);
     } catch (HttpTimeoutException e) {
       throw fail(request, started, "timeout", null, Usage.NONE);
     } catch (IOException e) {
@@ -119,6 +120,28 @@ final class ChatCompletionClient {
       throw fail(request, started, "http_status", status, Usage.NONE);
     }
     return content(request, started, response.body());
+  }
+
+  /**
+   * 応答の本文の受信が終わるまで、期限を {@link Request#timeout()} で区切る。JDK の HTTP の期限は、ヘッダーの受信まで
+   * しか効かないため、本文の遅れで処理が止まらないよう、ここで区切る。期限を過ぎたら通信をキャンセルする。
+   */
+  private HttpResponse<String> send(Request request)
+      throws IOException, InterruptedException, HttpTimeoutException {
+    CompletableFuture<HttpResponse<String>> future =
+        http.sendAsync(
+            httpRequest(request), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+    try {
+      return future.get(request.timeout().toMillis(), TimeUnit.MILLISECONDS);
+    } catch (TimeoutException e) {
+      future.cancel(true);
+      throw new HttpTimeoutException("応答が期限内に届きませんでした");
+    } catch (ExecutionException e) {
+      if (e.getCause() instanceof IOException io) {
+        throw io;
+      }
+      throw new IOException(e.getCause());
+    }
   }
 
   private HttpRequest httpRequest(Request request) {
