@@ -1,13 +1,13 @@
 {
   "$schema": "./agents-schema.json",
   "coordinator": {
-    "bot": "kyro-coordinator-app[bot]",
+    "bot": "kyro-coordinator[bot]",
     "appClientId": "Iv23lipQ98fZklc7jjBh"
   },
   "agents": {
     "claude": {
       "name": "Claude Code",
-      "bot": "kyro-claude-app[bot]",
+      "bot": "kyro-claude[bot]",
       "workflow": "coding-agent-claude.yml",
       "appClientId": "Iv23liwOH8CmfqnsXp4H",
       "fix": {
@@ -17,7 +17,7 @@
     },
     "codex": {
       "name": "Codex",
-      "bot": "kyro-codex-app[bot]",
+      "bot": "kyro-codex[bot]",
       "workflow": "coding-agent-codex.yml",
       "appClientId": "Iv23liMmrEQjGQOiUyVo",
       "fix": {
