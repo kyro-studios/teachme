@@ -5,10 +5,13 @@ import com.teachme.ai.fake.FakeAi;
 import com.teachme.ai.real.NotConfiguredLanguageModel;
 import com.teachme.application.HomeService;
 import com.teachme.application.HomeworkService;
+import com.teachme.application.MaterialOrganizer;
+import com.teachme.application.MaterialService;
 import com.teachme.application.SettingsService;
 import com.teachme.application.TestControlService;
 import com.teachme.persistence.Repositories;
 import com.teachme.web.HomeRoutes;
+import com.teachme.web.MaterialRoutes;
 import com.teachme.web.Routes;
 import com.teachme.web.SettingsRoutes;
 import com.teachme.web.SystemRoutes;
@@ -51,7 +54,7 @@ public final class Main {
     return routes;
   }
 
-  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ)。 */
+  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ、教材)。 */
   private static List<Routes> userRoutes(Components components, LanguageModel languageModel) {
     Repositories repositories = new Repositories(components.dataSource());
     SettingsService settings = new SettingsService(repositories.settings(), components.clock());
@@ -64,6 +67,13 @@ public final class Main {
             components.clock());
     HomeworkService homework =
         new HomeworkService(settings, repositories.todayModes(), languageModel, components.clock());
-    return List.of(new SettingsRoutes(settings), new HomeRoutes(home, homework));
+    MaterialOrganizer organizer =
+        new MaterialOrganizer(repositories.materials(), languageModel, components.clock());
+    MaterialService materials =
+        new MaterialService(settings, repositories.materials(), organizer, components.clock());
+    return List.of(
+        new SettingsRoutes(settings),
+        new HomeRoutes(home, homework),
+        new MaterialRoutes(materials, organizer));
   }
 }
