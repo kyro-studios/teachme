@@ -14,6 +14,7 @@ app/
 | --- | --- |
 | フロントエンドの開発サーバー (5173。`/api` はバックエンドの 8080 へ中継) | `cd app/frontend && npm run dev` |
 | バックエンドの起動 (8080。`AI_MODE` を指定しなければ `fake`) | `cd app/backend && ./gradlew run` |
+| jOOQ のコードの再生成 (Docker が必要。Testcontainers の PostgreSQL に migration を適用して生成する) | `cd app/backend && ./gradlew generateJooq` |
 | 画面と API を 1 つのオリジンで起動 | `PORT=4000 scripts/start-app.sh` |
 | ビルド、単体テスト、アーキテクチャのルール | `scripts/test.sh` |
 
