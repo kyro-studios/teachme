@@ -1,9 +1,13 @@
 package com.teachme.bootstrap;
 
+import com.teachme.ai.fake.FakeAi;
+import com.teachme.application.TestControlService;
 import com.teachme.web.Routes;
 import com.teachme.web.SystemRoutes;
+import com.teachme.web.TestRoutes;
 import com.teachme.web.WebApp;
 import io.javalin.Javalin;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
@@ -19,8 +23,18 @@ public final class Main {
     app.start(config.port());
   }
 
-  /** API ごとの Routes を並べる。機能を足すときは、ここに追加する。 */
+  /**
+   * API ごとの Routes を並べる。機能を足すときは、ここに追加する。
+   *
+   * <p>テスト用の API (`/api/test/*`) と、フェイクの外部 AI は、`AI_MODE=fake` のときだけ組み立てて登録する。`real` では登録せず、404
+   * を返す。
+   */
   static List<Routes> routes(AppConfig config, Components components) {
-    return List.of(new SystemRoutes(config.aiMode().name().toLowerCase(Locale.ROOT)));
+    List<Routes> routes = new ArrayList<>();
+    routes.add(new SystemRoutes(config.aiMode().name().toLowerCase(Locale.ROOT)));
+    if (config.aiMode() == AppConfig.AiMode.FAKE) {
+      routes.add(new TestRoutes(new TestControlService(new FakeAi())));
+    }
+    return routes;
   }
 }
