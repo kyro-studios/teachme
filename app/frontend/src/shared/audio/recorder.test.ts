@@ -172,3 +172,40 @@ test("マイクが使えないその他の失敗は、microphone_unavailable の
 
   expect((error as RecordingError).code).toBe("microphone_unavailable");
 });
+
+test("MediaRecorder の作成に失敗したら、マイクを解放し、microphone_unavailable の RecordingError を投げる", async () => {
+  vi.stubGlobal(
+    "MediaRecorder",
+    class extends FakeMediaRecorder {
+      constructor(stream: MediaStream, options?: MediaRecorderOptions) {
+        super(stream, options);
+        throw new DOMException("not supported", "NotSupportedError");
+      }
+    },
+  );
+
+  const error = await startRecording({ aiMode: "real" }).catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(RecordingError);
+  expect((error as RecordingError).code).toBe("microphone_unavailable");
+  expect(track.stop).toHaveBeenCalled();
+});
+
+test("録音の開始 (start) に失敗したら、マイクを解放し、microphone_unavailable の RecordingError を投げる", async () => {
+  vi.stubGlobal(
+    "MediaRecorder",
+    class extends FakeMediaRecorder {
+      start(): void {
+        throw new DOMException("cannot start", "InvalidStateError");
+      }
+    },
+  );
+
+  const error = await startRecording({ aiMode: "real" }).catch((e: unknown) => e);
+
+  expect(error).toBeInstanceOf(RecordingError);
+  expect((error as RecordingError).code).toBe("microphone_unavailable");
+  expect(track.stop).toHaveBeenCalled();
+  // 失敗した後は、60 秒の計時も残らない
+  expect(vi.getTimerCount()).toBe(0);
+});

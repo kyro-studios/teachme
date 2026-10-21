@@ -81,6 +81,20 @@ export async function startRecording({ aiMode }: { aiMode: AiMode }): Promise<Re
 
 async function startMicrophoneCapture(): Promise<Capture> {
   const stream = await openMicrophone();
+  try {
+    return beginMicrophoneCapture(stream);
+  } catch {
+    // 録音の初期化の途中で失敗しても、取得済みのマイクは必ず解放する
+    releaseMicrophone(stream);
+    throw new RecordingError(
+      "microphone_unavailable",
+      "録音を始められませんでした。もう一度試してください",
+    );
+  }
+}
+
+/** 取得済みのマイクで録音を始める。失敗したら例外を投げ、呼び出し元がマイクを解放する */
+function beginMicrophoneCapture(stream: MediaStream): Capture {
   const mimeType = chooseRecordingMimeType((type) => MediaRecorder.isTypeSupported(type));
 
   const recorder = new MediaRecorder(stream, {
