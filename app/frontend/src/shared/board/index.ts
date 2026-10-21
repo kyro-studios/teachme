@@ -2,7 +2,7 @@
 export { Board, type BoardHandle, type BoardProps } from "./Board";
 export type { BoardFigure, BoardWrite, InitialContent, StudentAnnotation } from "./types";
 export { cropFigure, cropRect, type CroppedFigure, type PixelRect } from "./figure";
-export { fitLongSide, type Point, type Region, type ScreenFrame } from "./geometry";
+export { fitLongSide, type Point, type Region } from "./geometry";
 export { fitWidth, stackFigures, type Placement, type Size } from "./layout";
 export {
   PenTracker,

@@ -1,7 +1,14 @@
 // tldraw の図形を作る部分。ボードの初期配置、AI の書き込み、ボードの画像の書き出し
-import { AssetRecordType, createShapeId, toRichText, type Editor, type TLShapeId } from "tldraw";
+import {
+  AssetRecordType,
+  Box,
+  createShapeId,
+  toRichText,
+  type Editor,
+  type TLShapeId,
+} from "tldraw";
 import { blobToDataUrl, cropFigure, type CroppedFigure } from "./figure";
-import { fitLongSide, regionToFrame, type Region } from "./geometry";
+import { expandRegion, fitLongSide, regionToFrame, unionRegions, type Region } from "./geometry";
 import { stackFigures, type Placement } from "./layout";
 import type { BoardWrite, InitialContent, StudentAnnotation } from "./types";
 
@@ -20,11 +27,26 @@ const ARROW_LENGTH = 96;
 const MIN_HIGHLIGHT_SIZE = 8;
 /** 範囲の無い文字の書き込みを置く位置 (枠に対する割合)。下の方の左に置く */
 const FALLBACK_TEXT_POSITION = { x: 0.05, y: 0.8 };
+/** ボードの画像の枠の余白 (ページの単位)。線の端が切れないように */
+const BOARD_IMAGE_MARGIN = 16;
 
-/** 画面に見えている範囲 (ページの単位)。割合の座標は、この枠に対して決める */
-function viewportFrame(editor: Editor): Region {
-  const bounds = editor.getViewportPageBounds();
-  return { x: bounds.x, y: bounds.y, width: bounds.w, height: bounds.h };
+/**
+ * ボードの画像に写す範囲 (ページの単位)。ボードの全部の図形を含み、画面の外の図形も入る。
+ * 図形が無いときは、画面に見えている範囲にする
+ */
+export function boardFrame(editor: Editor): Region {
+  const shapeRegions = [...editor.getCurrentPageShapeIds()].flatMap((id) => {
+    const bounds = editor.getShapePageBounds(id);
+    return bounds ? [{ x: bounds.x, y: bounds.y, width: bounds.w, height: bounds.h }] : [];
+  });
+  const viewport = editor.getViewportPageBounds();
+  const content = unionRegions(shapeRegions) ?? {
+    x: viewport.x,
+    y: viewport.y,
+    width: viewport.w,
+    height: viewport.h,
+  };
+  return expandRegion(content, BOARD_IMAGE_MARGIN);
 }
 
 function bottomOf(editor: Editor, id: TLShapeId): number {
@@ -127,10 +149,14 @@ function addFigure(editor: Editor, src: string, figure: CroppedFigure, placement
 
 /**
  * AI 生徒の印を置く。point は範囲の中心を指す矢印、question_mark は範囲の右上に「？」を置く。
- * 範囲は、画面に見えている範囲に対する割合
+ * 範囲は、送った画像の枠 (`frame`) に対する割合
  */
-export function placeStudentAnnotation(editor: Editor, annotation: StudentAnnotation): void {
-  const box = regionToFrame(annotation.region, viewportFrame(editor));
+export function placeStudentAnnotation(
+  editor: Editor,
+  annotation: StudentAnnotation,
+  frame: Region,
+): void {
+  const box = regionToFrame(annotation.region, frame);
   if (annotation.kind === "point") {
     const centerX = box.x + box.width / 2;
     const centerY = box.y + box.height / 2;
@@ -158,10 +184,10 @@ export function placeStudentAnnotation(editor: Editor, annotation: StudentAnnota
 /**
  * 先輩先生の書き込みを置く。
  * text は範囲の左上に置く (範囲が無ければ、画面の下の方の左に置く)。
- * highlight は範囲を囲む枠にする (範囲が無ければ何もしない)
+ * highlight は範囲を囲む枠にする (範囲が無ければ何もしない)。
+ * 範囲は、送った画像の枠 (`frame`) に対する割合
  */
-export function placeBoardWrite(editor: Editor, write: BoardWrite): void {
-  const frame = viewportFrame(editor);
+export function placeBoardWrite(editor: Editor, write: BoardWrite, frame: Region): void {
   if (write.kind === "highlight") {
     if (!write.region) {
       return;
@@ -197,15 +223,14 @@ export function placeBoardWrite(editor: Editor, write: BoardWrite): void {
 }
 
 /**
- * 画面に見えている範囲を、PNG にする。長辺は `BOARD_IMAGE_MAX_LONG_SIDE` 以下に縮小する。
- * 指している範囲の割合は、この画像と同じ枠で決まる
+ * `frame` の範囲を、PNG にする。長辺は `BOARD_IMAGE_MAX_LONG_SIDE` 以下に縮小する。
+ * 指している範囲と AI の書き込みは、この画像と同じ `frame` に対する割合で決まる
  */
-export async function exportBoardPng(editor: Editor): Promise<Blob> {
-  const frame = viewportFrame(editor);
+export async function exportBoardPng(editor: Editor, frame: Region): Promise<Blob> {
   const scale = fitLongSide(frame.width, frame.height, BOARD_IMAGE_MAX_LONG_SIDE);
   const { blob } = await editor.toImage([...editor.getCurrentPageShapeIds()], {
     format: "png",
-    bounds: editor.getViewportPageBounds(),
+    bounds: new Box(frame.x, frame.y, frame.width, frame.height),
     scale,
     pixelRatio: 1,
     padding: 0,

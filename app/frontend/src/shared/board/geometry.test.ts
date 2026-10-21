@@ -1,17 +1,12 @@
 import { expect, test } from "vitest";
-import { clamp01, fitLongSide, regionToFrame, toFraction } from "./geometry";
-
-test("画面上の点は、枠に対する割合にし、枠の外は 0 か 1 に収める", () => {
-  const frame = { left: 100, top: 50, width: 800, height: 600 };
-
-  expect(toFraction(500, 350, frame)).toEqual({ x: 0.5, y: 0.5 });
-  expect(toFraction(0, 0, frame)).toEqual({ x: 0, y: 0 });
-  expect(toFraction(2000, 2000, frame)).toEqual({ x: 1, y: 1 });
-});
-
-test("枠の大きさが 0 のときは、原点として扱う", () => {
-  expect(toFraction(10, 10, { left: 0, top: 0, width: 0, height: 0 })).toEqual({ x: 0, y: 0 });
-});
+import {
+  clamp01,
+  expandRegion,
+  fitLongSide,
+  frameToRegion,
+  regionToFrame,
+  unionRegions,
+} from "./geometry";
 
 test("0 から 1 の範囲に収める", () => {
   expect(clamp01(-0.2)).toBe(0);
@@ -48,4 +43,58 @@ test("縦長の画像も、長辺で縮小する", () => {
 
   expect(2400 * scale).toBe(1280);
   expect(900 * scale).toBeCloseTo(480);
+});
+
+test("ページの矩形を、枠に対する割合にする。枠の外へ出る分は端に収める", () => {
+  const frame = { x: 1000, y: 200, width: 1600, height: 900 };
+
+  expect(frameToRegion({ x: 1800, y: 425, width: 400, height: 450 }, frame)).toEqual({
+    x: 0.5,
+    y: 0.25,
+    width: 0.25,
+    height: 0.5,
+  });
+  expect(frameToRegion({ x: 0, y: 0, width: 5000, height: 5000 }, frame)).toEqual({
+    x: 0,
+    y: 0,
+    width: 1,
+    height: 1,
+  });
+});
+
+test("割合の矩形は、同じ枠の中でページの矩形に戻せる", () => {
+  // 送った画像の枠を変えなければ、描いた場所と AI の書き込みの場所は一致する
+  const sentFrame = { x: -300, y: 40, width: 2000, height: 1200 };
+  const page = { x: 120, y: 900, width: 260, height: 80 };
+
+  const fraction = frameToRegion(page, sentFrame);
+
+  const back = regionToFrame(fraction, sentFrame);
+  expect(back.x).toBeCloseTo(page.x);
+  expect(back.y).toBeCloseTo(page.y);
+  expect(back.width).toBeCloseTo(page.width);
+  expect(back.height).toBeCloseTo(page.height);
+});
+
+test("矩形の集まりを囲む矩形を返す。画面の外の矩形も含める", () => {
+  const union = unionRegions([
+    { x: 0, y: 0, width: 480, height: 300 },
+    { x: 0, y: 340, width: 480, height: 240 },
+    { x: 2400, y: 1200, width: 300, height: 200 },
+  ]);
+
+  expect(union).toEqual({ x: 0, y: 0, width: 2700, height: 1400 });
+});
+
+test("矩形が無いときは、囲む矩形は無い", () => {
+  expect(unionRegions([])).toBeNull();
+});
+
+test("矩形の四方を、同じ幅だけ広げる", () => {
+  expect(expandRegion({ x: 10, y: 20, width: 100, height: 50 }, 16)).toEqual({
+    x: -6,
+    y: 4,
+    width: 132,
+    height: 82,
+  });
 });

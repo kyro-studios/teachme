@@ -1,5 +1,5 @@
 // ペンの状態の追跡。ペン、指、マウスを同じに扱い、触れている間を「書き込み中」とする
-import type { Point, Region } from "./geometry";
+import { frameToRegion, type Point, type Region } from "./geometry";
 
 /** 指している範囲に含める、録音の開始より前の時間 (仕様書 5.5) */
 export const POINTED_LOOKBACK_MS = 10_000;
@@ -13,7 +13,7 @@ export type Contact = {
   startedAt: number;
   /** 離れた時刻。まだ触れているときは、判定の時点の時刻 */
   endedAt: number;
-  /** 触れていた範囲。ボードの枠に対する割合 */
+  /** 触れていた範囲。ページの単位 (ボードの座標) */
   region: Region;
 };
 
@@ -21,7 +21,7 @@ export type Contact = {
 export type RecordingRange = { startedAt: number; endedAt: number };
 
 /**
- * 録音の範囲の中で触れた接触の範囲を返す。
+ * 録音の範囲の中で触れた接触の範囲を返す (ページの単位)。
  *
  * - 対象は、録音の開始の 10 秒前から終了までに、少しでも触れていた接触。
  * - 件数が上限を超えるときは、新しいものを優先する。
@@ -51,7 +51,8 @@ function extend(extent: Extent, point: Point): void {
 
 /**
  * ボードへの接触を追跡する。DOM のイベントは、呼び出し側が変換して渡す。
- * 座標は、ボードの枠に対する割合で渡す。時刻は `now` で数える (テストのため差し替えられる)
+ * 座標は、ページの単位で渡す。画面の表示が変わっても、同じ場所を指し続けるため。
+ * 時刻は `now` で数える (テストのため差し替えられる)
  */
 export class PenTracker {
   private readonly active = new Map<number, ActiveContact>();
@@ -96,15 +97,20 @@ export class PenTracker {
     return this.releasedAt;
   }
 
-  /** 録音の範囲で触れた範囲 (最大 10 件)。まだ触れている接触も含める */
-  pointedRegions(range: RecordingRange): Region[] {
+  /**
+   * 録音の範囲で触れた範囲 (最大 10 件)。まだ触れている接触も含める。
+   * 返す範囲は、`frame` (送った画像の枠) に対する割合
+   */
+  pointedRegions(range: RecordingRange, frame: Region): Region[] {
     const now = this.now();
     const live = [...this.active.values()].map((contact) => ({
       startedAt: contact.startedAt,
       endedAt: now,
       region: toRegion(contact.extent),
     }));
-    return selectPointedRegions([...this.finished, ...live], range);
+    return selectPointedRegions([...this.finished, ...live], range).map((region) =>
+      frameToRegion(region, frame),
+    );
   }
 
   private finish(pointerId: number): void {

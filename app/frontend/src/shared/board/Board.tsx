@@ -2,12 +2,13 @@ import { useCallback, useEffect, useImperativeHandle, useRef, useState, type Ref
 import { Tldraw, type Editor } from "tldraw";
 import "tldraw/tldraw.css";
 import {
+  boardFrame,
   exportBoardPng,
   layoutInitialBoard,
   placeBoardWrite,
   placeStudentAnnotation,
 } from "./board-shapes";
-import { toFraction, type Point, type Region } from "./geometry";
+import type { Point, Region } from "./geometry";
 import { PenTracker, type RecordingRange } from "./pen";
 import type { BoardWrite, InitialContent, StudentAnnotation } from "./types";
 
@@ -19,13 +20,16 @@ export type BoardHandle = {
   isWriting(): boolean;
   /** 最後にペンを離した時刻 (`Date.now()` と同じ基準)。まだ離していなければ null */
   lastReleasedAt(): number | null;
-  /** 録音の範囲で触れた範囲 (最大 10 件)。割合で表す */
+  /**
+   * 録音の範囲で触れた範囲 (最大 10 件)。送った画像に対する割合で表す。
+   * まだ画像を送っていなければ、今のボードの範囲に対する割合
+   */
   pointedRegions(range: RecordingRange): Region[];
-  /** 画面に見えている範囲を PNG にする。長辺は 1280 px 以下 */
+  /** ボードの全体を PNG にする。長辺は 1280 px 以下。ここで決めた範囲が、以後の割合の基準になる */
   exportPng(): Promise<Blob>;
-  /** AI 生徒の印を追加する */
+  /** AI 生徒の印を追加する。範囲は、送った画像に対する割合 */
   addStudentAnnotation(annotation: StudentAnnotation): void;
-  /** 先輩先生の書き込みを追加する */
+  /** 先輩先生の書き込みを追加する。範囲は、送った画像に対する割合 */
   addBoardWrites(writes: readonly BoardWrite[]): void;
 };
 
@@ -43,23 +47,35 @@ export type BoardProps = InitialContent & {
 export function Board({ className = "", ref, ...content }: BoardProps) {
   const [initial] = useState<InitialContent>(() => content);
   const [tracker] = useState(() => new PenTracker());
-  const frameRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<Editor | null>(null);
+  // 最後に送った画像の枠 (ページの単位)。割合の座標は、すべてこの枠に対して決める
+  const imageFrameRef = useRef<Region | null>(null);
+
+  const currentImageFrame = (): Region => {
+    return imageFrameRef.current ?? boardFrame(requireEditor(editorRef));
+  };
 
   useImperativeHandle(
     ref,
     () => ({
       isWriting: () => tracker.isWriting(),
       lastReleasedAt: () => tracker.lastReleasedAt(),
-      pointedRegions: (range) => tracker.pointedRegions(range),
-      exportPng: () => exportBoardPng(requireEditor(editorRef)),
+      pointedRegions: (range) => tracker.pointedRegions(range, currentImageFrame()),
+      exportPng: async () => {
+        const editor = requireEditor(editorRef);
+        const frame = boardFrame(editor);
+        const blob = await exportBoardPng(editor, frame);
+        imageFrameRef.current = frame;
+        return blob;
+      },
       addStudentAnnotation: (annotation) => {
-        placeStudentAnnotation(requireEditor(editorRef), annotation);
+        placeStudentAnnotation(requireEditor(editorRef), annotation, currentImageFrame());
       },
       addBoardWrites: (writes) => {
         const editor = requireEditor(editorRef);
+        const frame = currentImageFrame();
         for (const write of writes) {
-          placeBoardWrite(editor, write);
+          placeBoardWrite(editor, write, frame);
         }
       },
     }),
@@ -78,9 +94,10 @@ export function Board({ className = "", ref, ...content }: BoardProps) {
     };
   }, [tracker]);
 
+  // 画面の点は、ページの単位に変換する。画面の表示が変わっても、同じ場所を指すように
   const pointOf = (event: { clientX: number; clientY: number }): Point => {
-    const frame = frameRef.current?.getBoundingClientRect();
-    return frame ? toFraction(event.clientX, event.clientY, frame) : { x: 0, y: 0 };
+    const editor = editorRef.current;
+    return editor ? editor.screenToPage({ x: event.clientX, y: event.clientY }) : { x: 0, y: 0 };
   };
 
   const handleMount = useCallback(
@@ -102,7 +119,6 @@ export function Board({ className = "", ref, ...content }: BoardProps) {
   // capture で受けて、tldraw の内部の処理より先に、ペンの接触を拾う
   return (
     <div
-      ref={frameRef}
       className={`relative h-full w-full touch-none ${className}`}
       onPointerDownCapture={(event) => tracker.press(event.pointerId, pointOf(event))}
       onPointerMoveCapture={(event) => tracker.move(event.pointerId, pointOf(event))}

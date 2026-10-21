@@ -5,6 +5,9 @@ function contact(startedAt: number, endedAt: number, x: number): Contact {
   return { startedAt, endedAt, region: { x, y: 0, width: 0.1, height: 0.1 } };
 }
 
+/** 送った画像の枠。ページの単位で、接触の座標と同じ基準 */
+const UNIT_FRAME = { x: 0, y: 0, width: 1, height: 1 };
+
 /** 時刻を手で進められる時計 */
 function clock(start = 1_000_000) {
   let current = start;
@@ -93,7 +96,7 @@ test("触れていない指の動きと離す操作は、無視する", () => {
 
   expect(tracker.isWriting()).toBe(false);
   expect(tracker.lastReleasedAt()).toBeNull();
-  expect(tracker.pointedRegions({ startedAt: 0, endedAt: 10_000 })).toEqual([]);
+  expect(tracker.pointedRegions({ startedAt: 0, endedAt: 10_000 }, UNIT_FRAME)).toEqual([]);
 });
 
 test("指している範囲は、触れた間の動きを囲む矩形になる", () => {
@@ -107,7 +110,7 @@ test("指している範囲は、触れた間の動きを囲む矩形になる",
   time.advance(100);
   tracker.release(1);
 
-  const regions = tracker.pointedRegions({ startedAt: 4_000, endedAt: 6_000 });
+  const regions = tracker.pointedRegions({ startedAt: 4_000, endedAt: 6_000 }, UNIT_FRAME);
 
   expect(regions).toHaveLength(1);
   expect(regions[0].x).toBeCloseTo(0.2);
@@ -123,7 +126,7 @@ test("まだ触れている接触も、指している範囲に含める", () =>
   tracker.press(1, { x: 0.3, y: 0.3 });
   time.advance(2_000);
 
-  const regions = tracker.pointedRegions({ startedAt: 5_000, endedAt: 6_000 });
+  const regions = tracker.pointedRegions({ startedAt: 5_000, endedAt: 6_000 }, UNIT_FRAME);
 
   expect(regions).toEqual([{ x: 0.3, y: 0.3, width: 0, height: 0 }]);
 });
@@ -137,6 +140,25 @@ test("録音の 10 秒前より前に離した接触は、指している範囲�
   time.advance(POINTED_LOOKBACK_MS + 1_000);
 
   expect(
-    tracker.pointedRegions({ startedAt: 5_000 + POINTED_LOOKBACK_MS + 1_000, endedAt: 30_000 }),
+    tracker.pointedRegions(
+      { startedAt: 5_000 + POINTED_LOOKBACK_MS + 1_000, endedAt: 30_000 },
+      UNIT_FRAME,
+    ),
   ).toEqual([]);
+});
+
+test("指している範囲は、ページの座標で持ち、渡された枠に対する割合で返す", () => {
+  const time = clock(5_000);
+  const tracker = new PenTracker(time.now);
+  // ページの (1200, 300) を指す。画面の表示は、この後に変わっても構わない
+  tracker.press(1, { x: 1200, y: 300 });
+  tracker.release(1);
+
+  // 送った画像の枠は、ページの (1000, 200) から 1600 x 900
+  const sentFrame = { x: 1000, y: 200, width: 1600, height: 900 };
+  const regions = tracker.pointedRegions({ startedAt: 5_000, endedAt: 6_000 }, sentFrame);
+
+  expect(regions).toHaveLength(1);
+  expect(regions[0].x).toBeCloseTo(0.125);
+  expect(regions[0].y).toBeCloseTo(0.111);
 });

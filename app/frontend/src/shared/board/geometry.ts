@@ -9,23 +9,9 @@ export type Region = { x: number; y: number; width: number; height: number };
 /** 対象の画像全体に対する、0 から 1 の割合で表した点 */
 export type Point = { x: number; y: number };
 
-/** 画面上の枠 (ボードの要素の矩形)。`DOMRect` の形の一部 */
-export type ScreenFrame = { left: number; top: number; width: number; height: number };
-
 /** 0 から 1 の範囲に収める */
 export function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
-}
-
-/** 画面上の点を、枠に対する割合の点にする。枠の外は 0 か 1 に収める */
-export function toFraction(clientX: number, clientY: number, frame: ScreenFrame): Point {
-  if (frame.width <= 0 || frame.height <= 0) {
-    return { x: 0, y: 0 };
-  }
-  return {
-    x: clamp01((clientX - frame.left) / frame.width),
-    y: clamp01((clientY - frame.top) / frame.height),
-  };
 }
 
 /** 割合の矩形を、ボードの枠 (ページの単位) の中の矩形にする */
@@ -35,6 +21,40 @@ export function regionToFrame(region: Region, frame: Region): Region {
     y: frame.y + region.y * frame.height,
     width: region.width * frame.width,
     height: region.height * frame.height,
+  };
+}
+
+/**
+ * ページの単位の矩形を、枠に対する割合の矩形にする (`regionToFrame` の逆)。
+ * 枠の外へ出る分は、枠の端に収める。枠の幅と高さは 0 より大きいこと
+ */
+export function frameToRegion(rect: Region, frame: Region): Region {
+  const left = clamp01((rect.x - frame.x) / frame.width);
+  const top = clamp01((rect.y - frame.y) / frame.height);
+  const right = clamp01((rect.x + rect.width - frame.x) / frame.width);
+  const bottom = clamp01((rect.y + rect.height - frame.y) / frame.height);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/** 矩形の集まりを囲む矩形。集まりが空のときは null */
+export function unionRegions(regions: readonly Region[]): Region | null {
+  if (regions.length === 0) {
+    return null;
+  }
+  const left = Math.min(...regions.map((region) => region.x));
+  const top = Math.min(...regions.map((region) => region.y));
+  const right = Math.max(...regions.map((region) => region.x + region.width));
+  const bottom = Math.max(...regions.map((region) => region.y + region.height));
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
+/** 矩形の四方を、同じ幅だけ広げる */
+export function expandRegion(region: Region, margin: number): Region {
+  return {
+    x: region.x - margin,
+    y: region.y - margin,
+    width: region.width + margin * 2,
+    height: region.height + margin * 2,
   };
 }
 
