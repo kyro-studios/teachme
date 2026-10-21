@@ -11,10 +11,12 @@ repositories {
 dependencies {
     implementation("io.javalin:javalin:6.7.0")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.19.2")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.19.2")
     implementation("org.jooq:jooq:3.20.5")
     implementation("org.flywaydb:flyway-core:11.10.5")
     implementation("org.flywaydb:flyway-database-postgresql:11.10.5")
-    runtimeOnly("org.postgresql:postgresql:42.7.7")
+    // 接続のデータソースは、bootstrap が DataSource として受け取る (persistence の DataSources で作る)
+    implementation("org.postgresql:postgresql:42.7.7")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.17")
 
     testImplementation(platform("org.junit:junit-bom:5.13.4"))
