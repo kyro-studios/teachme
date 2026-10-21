@@ -22,11 +22,24 @@ dependencies {
     testImplementation("io.javalin:javalin-testtools:6.7.0")
     testImplementation("org.testcontainers:postgresql:1.21.3")
     testImplementation("org.testcontainers:junit-jupiter:1.21.3")
+    // jOOQ のコード生成 (generateJooq) は、テストのソースの JooqCodegen が行う
+    testImplementation("org.jooq:jooq-codegen:3.20.5")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 application {
     mainClass = "com.teachme.bootstrap.Main"
+}
+
+// Testcontainers の PostgreSQL に migration を適用してから、jOOQ のコードを生成する。
+// 生成物は persistence/generated に出力し、git に入れる。Docker が必要。
+tasks.register<JavaExec>("generateJooq") {
+    group = "jooq"
+    description = "Testcontainers の PostgreSQL に migration を適用し、jOOQ のコードを生成する"
+    dependsOn(tasks.testClasses)
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "com.teachme.testsupport.JooqCodegen"
+    args(file("src/main/java").absolutePath)
 }
 
 tasks.withType<JavaCompile> {
