@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["problemText", "answerSheet", "studentComment"],
+  "properties": {
+    "problemText": { "type": "string" },
+    "answerSheet": { "type": "string" },
+    "studentComment": { "type": "string" }
+  }
+}
