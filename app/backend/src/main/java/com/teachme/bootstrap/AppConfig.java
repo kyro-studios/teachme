@@ -8,9 +8,14 @@ import java.util.Optional;
  * 環境変数から読む、バックエンドの起動の設定。
  *
  * @param llm `AI_MODE=real` のときだけ、LLM の設定 (fake のときは、秘密情報を読まない)
+ * @param elevenLabs `AI_MODE=real` のときだけ、ElevenLabs の設定 (fake のときは、秘密情報を読まない)
  */
 public record AppConfig(
-    int port, Optional<Path> staticDir, AiMode aiMode, Optional<LlmConfig> llm) {
+    int port,
+    Optional<Path> staticDir,
+    AiMode aiMode,
+    Optional<LlmConfig> llm,
+    Optional<ElevenLabsConfig> elevenLabs) {
 
   public enum AiMode {
     REAL,
@@ -20,10 +25,10 @@ public record AppConfig(
   private static final int DEFAULT_PORT = 8080;
 
   /**
-   * `ENV=production` のときは `AI_MODE` を `real` に固定し、`fake` を指定すると起動に失敗する。`real` のときは、LLM
+   * `ENV=production` のときは `AI_MODE` を `real` に固定し、`fake` を指定すると起動に失敗する。`real` のときは、LLM と ElevenLabs
    * の必須の環境変数を検査する。
    *
-   * @throws IllegalStateException `real` で LLM の環境変数が無いとき、または設定の誤り
+   * @throws IllegalStateException `real` で LLM か ElevenLabs の環境変数が無いとき、または設定の誤り
    */
   public static AppConfig fromEnv(Map<String, String> env) {
     boolean production = "production".equals(env.get("ENV"));
@@ -44,6 +49,8 @@ public record AppConfig(
     }
     Optional<LlmConfig> llm =
         aiMode == AiMode.REAL ? Optional.of(LlmConfig.fromEnv(env)) : Optional.empty();
+    Optional<ElevenLabsConfig> elevenLabs =
+        aiMode == AiMode.REAL ? Optional.of(ElevenLabsConfig.fromEnv(env)) : Optional.empty();
 
     String portValue = env.get("PORT");
     int port =
@@ -55,6 +62,6 @@ public record AppConfig(
             ? Optional.empty()
             : Optional.of(Path.of(staticDirValue));
 
-    return new AppConfig(port, staticDir, aiMode, llm);
+    return new AppConfig(port, staticDir, aiMode, llm, elevenLabs);
   }
 }

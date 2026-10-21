@@ -58,7 +58,11 @@ class MainRoutesTest {
                 "AI_MODE", "real",
                 "LLM_API_KEY", "test-key",
                 "LLM_MODEL_ORGANIZE", "organize-model",
-                "LLM_MODEL_DIALOGUE", "dialogue-model"));
+                "LLM_MODEL_DIALOGUE", "dialogue-model",
+                "ELEVENLABS_API_KEY", "eleven-key",
+                "ELEVENLABS_VOICE_IDS", "intuitive=a,diligent=b,logical=c,mentor=d",
+                "ELEVENLABS_STT_MODEL", "stt-model",
+                "ELEVENLABS_TTS_MODEL", "tts-model"));
 
     JavalinTest.test(
         WebApp.create(Optional.empty(), Main.routes(config, WITHOUT_DATABASE)),
