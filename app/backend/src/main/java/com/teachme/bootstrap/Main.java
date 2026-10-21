@@ -1,8 +1,16 @@
 package com.teachme.bootstrap;
 
+import com.teachme.ai.LanguageModel;
 import com.teachme.ai.fake.FakeAi;
+import com.teachme.ai.real.NotConfiguredLanguageModel;
+import com.teachme.application.HomeService;
+import com.teachme.application.HomeworkService;
+import com.teachme.application.SettingsService;
 import com.teachme.application.TestControlService;
+import com.teachme.persistence.Repositories;
+import com.teachme.web.HomeRoutes;
 import com.teachme.web.Routes;
+import com.teachme.web.SettingsRoutes;
 import com.teachme.web.SystemRoutes;
 import com.teachme.web.TestRoutes;
 import com.teachme.web.WebApp;
@@ -32,9 +40,30 @@ public final class Main {
   static List<Routes> routes(AppConfig config, Components components) {
     List<Routes> routes = new ArrayList<>();
     routes.add(new SystemRoutes(config.aiMode().name().toLowerCase(Locale.ROOT)));
-    if (config.aiMode() == AppConfig.AiMode.FAKE) {
-      routes.add(new TestRoutes(new TestControlService(new FakeAi())));
+    boolean fake = config.aiMode() == AppConfig.AiMode.FAKE;
+    FakeAi fakeAi = new FakeAi();
+    // 実際の LLM の実装は、まだ無い。real では、呼び出しを失敗として返す
+    LanguageModel languageModel = fake ? fakeAi : new NotConfiguredLanguageModel();
+    routes.addAll(userRoutes(components, languageModel));
+    if (fake) {
+      routes.add(new TestRoutes(new TestControlService(fakeAi)));
     }
     return routes;
+  }
+
+  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ)。 */
+  private static List<Routes> userRoutes(Components components, LanguageModel languageModel) {
+    Repositories repositories = new Repositories(components.dataSource());
+    SettingsService settings = new SettingsService(repositories.settings(), components.clock());
+    HomeService home =
+        new HomeService(
+            settings,
+            repositories.lessonRecords(),
+            repositories.todayModes(),
+            repositories.units(),
+            components.clock());
+    HomeworkService homework =
+        new HomeworkService(settings, repositories.todayModes(), languageModel, components.clock());
+    return List.of(new SettingsRoutes(settings), new HomeRoutes(home, homework));
   }
 }

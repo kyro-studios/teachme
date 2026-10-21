@@ -18,6 +18,9 @@ import java.util.Optional;
 public final class WebApp {
   private static final String API_PREFIX = "/api";
 
+  /** リクエスト全体の上限 (openapi.yaml の共通の決まり。画像 1 枚 10 MB に、ほかの項目の分を足す)。 */
+  private static final long MAX_REQUEST_BYTES = 32L * 1024 * 1024;
+
   private WebApp() {}
 
   public static Javalin create(Optional<Path> staticDir) {
@@ -33,6 +36,7 @@ public final class WebApp {
         Javalin.create(
             config -> {
               config.jsonMapper(new JavalinJackson(Json.mapper(), false));
+              config.http.maxRequestSize = MAX_REQUEST_BYTES;
               staticDir.ifPresent(
                   dir ->
                       config.staticFiles.add(

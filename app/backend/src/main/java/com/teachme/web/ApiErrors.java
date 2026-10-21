@@ -1,5 +1,7 @@
 package com.teachme.web;
 
+import com.teachme.application.ConflictException;
+import com.teachme.application.InvalidInputException;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpResponseException;
@@ -10,6 +12,7 @@ import org.slf4j.LoggerFactory;
 final class ApiErrors {
   static final String NOT_FOUND_MESSAGE = "対象が見つかりません";
   static final String INVALID_REQUEST_MESSAGE = "入力の形式が正しくありません";
+  static final String VALIDATION_MESSAGE = "入力の内容を確かめてください";
   static final String INTERNAL_ERROR_MESSAGE = "サーバーで問題が起きました。もう一度お試しください";
 
   private static final Logger LOG = LoggerFactory.getLogger(ApiErrors.class);
@@ -21,6 +24,14 @@ final class ApiErrors {
         ApiException.class,
         (e, ctx) ->
             ctx.status(e.status()).json(ErrorResponse.of(e.code(), e.getMessage(), e.fields())));
+    app.exception(
+        ConflictException.class,
+        (e, ctx) -> ctx.status(409).json(ErrorResponse.of(e.code(), e.getMessage(), null)));
+    app.exception(
+        InvalidInputException.class,
+        (e, ctx) ->
+            ctx.status(400)
+                .json(ErrorResponse.of("validation_error", VALIDATION_MESSAGE, e.fields())));
     app.exception(
         HttpResponseException.class,
         (e, ctx) -> {
