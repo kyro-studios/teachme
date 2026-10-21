@@ -1,0 +1,1684 @@
+openapi: 3.0.3
+info:
+  title: teachme API
+  version: 1.0.0
+  description: |
+    AI 生徒育成型・対話学習サービスの API の契約。画面と同じオリジンの `/api` で提供する。
+    機能を重ねるたびに、このファイルへ書き足す。
+
+    ## 共通の決まり
+
+    - 利用者の識別: 利用者を識別する Cookie `teachme_uid` を、バックエンドが最初のリクエストで発行する (HttpOnly、SameSite=Lax、有効期間 400 日)。
+      クライアントは Cookie を送るだけでよく、リクエストに識別子を書かない。Cookie が無いブラウザは、別の利用者として扱う。
+      Playwright では、`page` と `context.request` が同じ Cookie を共有する。
+    - 日付と週は日本時間 (Asia/Tokyo) で扱う。週は月曜の 0 時に始まる。日時は ISO 8601 (オフセット付き) の文字列で返す。
+    - 設定が未完了の利用者が、設定を必要とする API を呼ぶと、409 `setup_required` を返す。
+    - 設定を必要とする API は、`GET /settings`、`PUT /settings`、`GET /student-types`、`GET /config`、`GET /healthz`、`/test/*` 以外のすべて。
+    - エラーは、すべて `ErrorResponse` の形で返す。`code` は機械が見る識別子、`message` は画面に出してよい日本語の文言 (仕様書 8 節と 10 節の文言) とする。
+      入力の誤りは 400 とし、`fields` に項目ごとの文言を入れる。
+    - 外部 AI サービスの失敗は、502 と、API ごとに決めた `code` で返す。バックエンドは、外部 AI サービスの呼び出しを自動では再試行しない (教材の整理だけが、自動で 1 回だけやり直す)。
+    - 授業と相談の API は、利用者が設定の個人情報の確認を済ませていないと、409 `privacy_not_confirmed` を返す。
+    - 同じ授業、相談、教材、単元に対する処理が進行中のときに、同じ処理を重ねて呼ぶと、409 `busy` を返す。外部 AI サービスを二重に呼ばないための決まりである。
+    - `multipart/form-data` の画像は、JPEG か PNG、1 枚 10 MB 以下とする。リクエスト全体の上限は 32 MB とする (Cloud Run の上限に合わせる)。
+  x-fake-mode: |
+    `GET /config` の `aiMode` が `fake` のとき (環境変数 `AI_MODE=fake`)、外部 AI サービスはフェイクに差し替わり、
+    `tags: test-control` の API (`/test/*`) が使える。`aiMode` が `real` のときは、`/test/*` はすべて 404 を返す。
+servers:
+  - url: /api
+tags:
+  - name: setup
+    description: 初期セットアップと設定 (仕様書 5.1)
+  - name: home
+    description: ホームと今日のモード、宿題の丸つけ (仕様書 5.2)
+  - name: materials
+    description: 先生準備室の教材 (仕様書 5.3、5.9)
+  - name: consultations
+    description: 先輩先生への相談 (仕様書 5.4)
+  - name: lessons
+    description: 授業とまとめノート (仕様書 5.5、5.6)
+  - name: mock-exams
+    description: 模試 (仕様書 5.7)
+  - name: records
+    description: 学習記録と削除 (仕様書 5.8、5.9)
+  - name: system
+    description: 稼働の確認と実行時の設定
+  - name: test-control
+    description: フェイクの外部 AI サービスをテストから操作する API。`aiMode` が `fake` のときだけ使える
+
+paths:
+  /config:
+    get:
+      tags: [system]
+      operationId: getConfig
+      summary: 実行時の設定を返す
+      responses:
+        '200':
+          description: 実行時の設定
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [aiMode]
+                properties:
+                  aiMode:
+                    type: string
+                    enum: [real, fake]
+                    description: |
+                      `fake` のとき、フロントエンドはマイクを使わず、録音の代わりに短い固定の音声データを送る。
+                      Live2D の読み込みに失敗しても、画面は進む。
+
+  /healthz:
+    get:
+      tags: [system]
+      operationId: getHealth
+      summary: 稼働を確認する (設定を必要とせず、DB にも外部 AI にも触れない)
+      responses:
+        '200':
+          description: 稼働している。本文は `ok`
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+
+  /student-types:
+    get:
+      tags: [setup]
+      operationId: listStudentTypes
+      summary: AI 生徒の種類を返す (仕様書 1.3)
+      responses:
+        '200':
+          description: 3 種類を、直感・感覚派、真面目な暗記派、論理・ツッコミ派の順に返す
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [studentTypes]
+                properties:
+                  studentTypes:
+                    type: array
+                    minItems: 3
+                    maxItems: 3
+                    items:
+                      $ref: '#/components/schemas/StudentType'
+              example:
+                studentTypes:
+                  - { id: intuitive, displayName: 直感・感覚派, initialDeviation: 45, targetDeviation: 50 }
+                  - { id: diligent, displayName: 真面目な暗記派, initialDeviation: 52, targetDeviation: 58 }
+                  - { id: logical, displayName: 論理・ツッコミ派, initialDeviation: 60, targetDeviation: 65 }
+
+  /settings:
+    get:
+      tags: [setup]
+      operationId: getSettings
+      summary: 利用者の設定を返す。未完了なら `completed` が false になる
+      responses:
+        '200':
+          description: 設定
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsResponse'
+    put:
+      tags: [setup]
+      operationId: saveSettings
+      summary: 設定を保存する (「始める」と、完了後の設定の変更)
+      description: |
+        - 初回 (未完了) は、設定を完了済みにする。完了後は、教科、単元名、週の授業回数だけを変える。
+        - 完了後に `studentTypeId` が保存済みの値と違うときは、400 とし、`fields.studentTypeId` に文言を入れる。
+        - 同じ教科に、前後の空白を除いて同じ単元名があるときは、新しい単元を作らず、その単元を現在の単元にする。
+        - 無効な入力があるときは、何も保存しない。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SettingsInput'
+      responses:
+        '200':
+          description: 保存した設定
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SettingsResponse'
+        '400':
+          description: |
+            入力の誤り。`code` は `validation_error`。`fields` のキーは、`studentTypeId`、`subject`、`unitName`、`lessonsPerWeek`、`privacyConfirmed`。
+            文言: 「生徒を 1 人選んでください」「教科を選んでください」「単元名は 1 文字以上 30 文字以内で入力してください」「週の授業回数を選んでください」。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /home:
+    get:
+      tags: [home]
+      operationId: getHome
+      summary: ホームの表示内容を返す (仕様書 5.2)
+      description: 今日のモードは、保存した日付が今日 (日本時間) でなければ、通常として返す。
+      responses:
+        '200':
+          description: ホームの表示内容
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Home'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /today-mode:
+    put:
+      tags: [home]
+      operationId: setTodayMode
+      summary: 今日のモードを切り替える (確認は出さない)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:
+                  $ref: '#/components/schemas/TodayMode'
+      responses:
+        '200':
+          description: 切り替えた後のホームの表示内容
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Home'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /homework-checks:
+    post:
+      tags: [home]
+      operationId: checkHomework
+      summary: 宿題の写真を判定する (仕様書 5.2)
+      description: |
+        写真と判定の結果は保存しない。今日のモードが宿題の丸つけでないときは、409 `mode_not_homework_check` を返す。
+        LLM が失敗したときも、200 で `verdict` を `undetermined` にして返す (仕様書 8 節)。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [photo, photoConfirmed]
+              properties:
+                photo:
+                  type: string
+                  format: binary
+                  description: JPEG か PNG。10 MB 以下
+                photoConfirmed:
+                  type: boolean
+                  description: 「写真に氏名、学校名、連絡先が写っていないことを確認しました」のチェック。true でなければ 400 `photo_not_confirmed`
+      responses:
+        '200':
+          description: 判定の結果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HomeworkResult'
+        '400':
+          $ref: '#/components/responses/InvalidImage'
+        '409':
+          description: '`setup_required` または `mode_not_homework_check`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /materials:
+    get:
+      tags: [materials]
+      operationId: listMaterials
+      summary: 現在の単元の教材を、登録順に返す
+      responses:
+        '200':
+          description: 教材の一覧。`number` は登録順の番号 (1 から)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [materials]
+                properties:
+                  materials:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MaterialSummary'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+    post:
+      tags: [materials]
+      operationId: createMaterial
+      summary: 教材を登録し、整理を始める (仕様書 5.3)
+      description: |
+        画像を保存し、状態を `organizing` にして、すぐに 202 を返す。整理はバックエンドが非同期で行い、画面を離れても続ける。
+        利用者は、`GET /materials/{materialId}` を繰り返し呼んで、結果を知る。
+        無効な入力のときは、何も保存せず、外部へも送らない。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [images, photoConfirmed]
+              properties:
+                images:
+                  type: array
+                  minItems: 1
+                  maxItems: 3
+                  items:
+                    type: string
+                    format: binary
+                  description: JPEG か PNG。1 枚 10 MB 以下。1 枚から 3 枚
+                photoConfirmed:
+                  type: boolean
+                  description: 写真の確認のチェック。true でなければ 400 `photo_not_confirmed`
+            encoding:
+              images:
+                contentType: image/jpeg, image/png
+      responses:
+        '202':
+          description: 教材を作り、整理を始めた
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialSummary'
+        '400':
+          $ref: '#/components/responses/InvalidImage'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /materials/{materialId}:
+    parameters:
+      - $ref: '#/components/parameters/MaterialId'
+    get:
+      tags: [materials]
+      operationId: getMaterial
+      summary: 教材の詳細を返す。整理済みのときは、整理の結果を含む
+      responses:
+        '200':
+          description: 教材の詳細
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+    delete:
+      tags: [materials]
+      operationId: deleteMaterial
+      summary: 教材と整理の結果を削除する (仕様書 5.9)
+      description: 授業の記録、まとめノート、模試の結果は残す。削除は 1 回だけ行い、すでに無い教材への呼び出しも 204 を返す (二重の押下を許す)。
+      responses:
+        '204':
+          description: 削除した (または、すでに無かった)
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /materials/{materialId}/retry:
+    parameters:
+      - $ref: '#/components/parameters/MaterialId'
+    post:
+      tags: [materials]
+      operationId: retryMaterial
+      summary: 整理に失敗した教材の整理を、もう一度始める (仕様書 5.3 の「やり直す」)
+      description: 状態が `failed` のときだけ受け付け、`organizing` にして 202 を返す。再試行の回数に上限は設けない。
+      responses:
+        '202':
+          description: 整理をもう一度始めた
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MaterialSummary'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`setup_required`、または状態が `failed` ではない (`material_not_failed`)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /materials/{materialId}/images/{position}:
+    parameters:
+      - $ref: '#/components/parameters/MaterialId'
+      - $ref: '#/components/parameters/ImagePosition'
+    get:
+      tags: [materials]
+      operationId: getMaterialImage
+      summary: 教材の画像を、登録したときのまま返す (図表の切り出しに使う)
+      description: |
+        画面は、`Figure.region` の矩形を、この画像から切り出してボードや教材の詳細に表示する。
+        画像は、登録したときのバイト列のまま返す。ほかの利用者の教材、または存在しない番号は 404 を返す。
+      responses:
+        '200':
+          description: 教材の画像 (JPEG か PNG。`Content-Type` で区別する)
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /consultations:
+    post:
+      tags: [consultations]
+      operationId: startConsultation
+      summary: 先輩先生への相談を始める (仕様書 5.4)
+      description: |
+        整理済みの教材だけを使える。相談の開始時刻と期限をサーバーが決める。
+        同じ利用者の、進行中の相談は、中断として消す。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [materialId]
+              properties:
+                materialId:
+                  type: string
+                  format: uuid
+      responses:
+        '201':
+          description: 相談を始めた
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsultationStart'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`setup_required`、`privacy_not_confirmed`、`material_not_organized`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /consultations/{consultationId}/utterances:
+    parameters:
+      - $ref: '#/components/parameters/ConsultationId'
+    post:
+      tags: [consultations]
+      operationId: sendConsultationUtterance
+      summary: 録音を文章にする (STT)。応答は作らない
+      description: 授業の `POST /lessons/{lessonId}/utterances` と同じ振る舞い。上限は、相談の 15 往復と 10 分。
+      requestBody:
+        $ref: '#/components/requestBodies/UtteranceAudio'
+      responses:
+        '200':
+          $ref: '#/components/responses/UtteranceRecognized'
+        '400':
+          $ref: '#/components/responses/InvalidAudio'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DialogueConflict'
+
+  /consultations/{consultationId}/utterances/{utteranceId}/reply:
+    parameters:
+      - $ref: '#/components/parameters/ConsultationId'
+      - $ref: '#/components/parameters/UtteranceId'
+    post:
+      tags: [consultations]
+      operationId: replyConsultation
+      summary: 認識できた発話に対する、先輩先生の応答を作る (LLM を 1 回呼ぶ)
+      description: |
+        応答の材料は、問題、模範解答、解説、指導のポイント、発話、これまでの字幕、ボードの画像、指している範囲。
+        - 受け付けるのは、`utteranceId` が未応答の最後の発話のときだけ。応答済みなら 409 `already_replied`、新しい発話で置き換えられていれば 409 `utterance_not_found`。
+        - 受け付けの時点で、往復が 15 未満で、期限に達していないことを確かめる。満たさなければ 409 `limit_reached`。
+        - 受け付けた 1 往復は、期限をまたいでも完了させる。
+        - 成功すると、相談の行を確かめたうえで、応答の字幕を保持し、往復を 1 つ増やす。相談の行が無ければ (中断された後なら) 結果を捨てて 404 を返す。
+        - 失敗したときは、往復を増やさない。利用者の字幕は残す。
+      requestBody:
+        $ref: '#/components/requestBodies/ReplyMaterials'
+      responses:
+        '200':
+          description: 先輩先生の応答
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConsultationReply'
+        '400':
+          $ref: '#/components/responses/InvalidBoardImage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DialogueConflict'
+        '502':
+          description: |
+            LLM の失敗。`code` は `mentor_reply_failed`、`message` は「先輩先生の応答を作れませんでした。もう一度話してください」。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /consultations/{consultationId}/turns/{turnId}/audio:
+    parameters:
+      - $ref: '#/components/parameters/ConsultationId'
+      - $ref: '#/components/parameters/TurnId'
+    get:
+      tags: [consultations]
+      operationId: getConsultationTurnAudio
+      summary: 先輩先生の応答の音声を返す (TTS)
+      description: 応答 1 つにつき、音声の生成は 1 回だけ行い、結果を保持して、再度の取得には保持した音声を返す。
+      responses:
+        '200':
+          $ref: '#/components/responses/Audio'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          $ref: '#/components/responses/TtsFailed'
+
+  /consultations/{consultationId}/abandon:
+    parameters:
+      - $ref: '#/components/parameters/ConsultationId'
+    post:
+      tags: [consultations]
+      operationId: abandonConsultation
+      summary: 相談を中断する。字幕を消す
+      description: 画面を離れるときに、クライアントが `fetch` の `keepalive` で呼ぶ。すでに無い相談でも 204 を返す。
+      responses:
+        '204':
+          description: 中断した (または、すでに無かった)
+
+  /lessons:
+    post:
+      tags: [lessons]
+      operationId: startLesson
+      summary: 授業を始める (仕様書 5.5)
+      description: |
+        開始時刻と期限をサーバーが決める。AI 生徒の最初の発話を作って返す (往復には数えない)。
+        最初の発話の LLM が失敗したときは、固定の文言で最初の発話を返す (進行を止めない)。
+        同じ利用者の、進行中の授業は、中断として消す。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [materialId]
+              properties:
+                materialId:
+                  type: string
+                  format: uuid
+      responses:
+        '201':
+          description: 授業を始めた
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LessonStart'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`setup_required`、`privacy_not_confirmed`、`mode_not_normal` (今日のモードが通常ではない)、`material_not_organized`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /lessons/{lessonId}/utterances:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: sendLessonUtterance
+      summary: 録音を文章にする (STT)。応答は作らない
+      description: |
+        利用者が「話し終える」を押した直後に呼ぶ。認識の結果が返った時点で、クライアントが相槌を表示する (NFR-101)。
+        認識結果が空のとき、または STT が失敗したときは、200 で `recognized` を false にして返す。往復には数えない。
+        認識できたときは、利用者の字幕を、授業の字幕として保持し、`utteranceId` を返す。
+        未応答の利用者の字幕 (`replied` が false) が残っていれば、それを消して置き換える。未応答の発話は、授業ごとに 1 件だけ。
+        授業の上限 (往復 20 回、または期限) に達しているときは、録音を捨てて 409 `limit_reached` を返す。
+        STT の返答の時点で授業が無いとき (中断された後) は、結果を捨てて 404 を返す。
+        録音データは、認識が終われば残さない。
+      requestBody:
+        $ref: '#/components/requestBodies/UtteranceAudio'
+      responses:
+        '200':
+          $ref: '#/components/responses/UtteranceRecognized'
+        '400':
+          $ref: '#/components/responses/InvalidAudio'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DialogueConflict'
+
+  /lessons/{lessonId}/utterances/{utteranceId}/reply:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+      - $ref: '#/components/parameters/UtteranceId'
+    post:
+      tags: [lessons]
+      operationId: replyLesson
+      summary: 認識できた発話に対する、AI 生徒の応答と学習評価を作る (LLM を 2 回、並べて呼ぶ)
+      description: |
+        - 生徒の応答の材料は、問題文、ボードの画像、発話、これまでの字幕、指している範囲。模範解答、解説、指導のポイントは渡さない。
+        - 学習評価の材料は、指導のポイント 3 件、模範解答、解説、問題文、ボードの画像、発話、これまでの字幕、指している範囲。結果は返さない。
+        - 両方が終わってから返す。学習評価だけが失敗したときは、応答を返し、その発話の度合いは変えない。
+        - 受け付けるのは、`utteranceId` が未応答の最後の発話のときだけ。応答済みなら 409 `already_replied`、新しい発話で置き換えられていれば 409 `utterance_not_found`。
+        - 受け付けの時点で、往復が 20 未満で、期限に達していないことを確かめる。満たさなければ 409 `limit_reached`。
+        - 受け付けた 1 往復は、期限をまたいでも完了させる (応答の途中で期限に達しても、その 1 往復は終える)。
+        - 成功すると、授業の行を確かめたうえで、応答の字幕を保持し、往復を 1 つ増やし、度合いを「それまでの最大値」で更新する。授業の行が無ければ (中断された後なら) 結果を捨てて 404 を返す。
+        - 生徒の応答が失敗したときは、502 を返す。往復も度合いも変えない。利用者の字幕は残す。
+      requestBody:
+        $ref: '#/components/requestBodies/ReplyMaterials'
+      responses:
+        '200':
+          description: AI 生徒の応答
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LessonReply'
+        '400':
+          $ref: '#/components/responses/InvalidBoardImage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DialogueConflict'
+        '502':
+          description: |
+            生徒の応答の LLM の失敗。`code` は `student_reply_failed`、`message` は「生徒の応答を作れませんでした。もう一度話してください」。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /lessons/{lessonId}/turns/{turnId}/audio:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+      - $ref: '#/components/parameters/TurnId'
+    get:
+      tags: [lessons]
+      operationId: getLessonTurnAudio
+      summary: AI 生徒の発話の音声を返す (TTS)
+      description: 発話 1 つにつき、音声の生成は 1 回だけ行う。まとめ文は音声にしない。
+      responses:
+        '200':
+          $ref: '#/components/responses/Audio'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          $ref: '#/components/responses/TtsFailed'
+
+  /lessons/{lessonId}/summary:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: createLessonSummary
+      summary: チャイムの後に、まとめノートを作り、授業を記録する (仕様書 5.6)
+      description: |
+        - 授業が無いとき (中断された後、またはほかの利用者のもの) は、404 を返す。LLM は呼ばない。
+        - 同じ授業の記録が既にあれば、LLM を呼ばず、保存済みの結果を 200 で返す。
+        - 授業の上限 (往復 20 回、または期限) に達していないときは、409 `limit_not_reached`。
+        - 処理中 (`busy`) のときは、409 `busy`。
+        - LLM を 1 回呼び、まとめ文と引用する板書を作る。材料は、この授業の字幕と、リクエストのボードの画像。
+        - 成功したときは、1 つのトランザクションで行う。まず授業の行を `for update` で取り、
+          行が無ければ (LLM の呼び出しの間に中断された)、結果を捨てて 404 を返し、何も記録しない。
+          行があれば、授業の記録とまとめノートの保存、理解度の更新 (`min(100, 前の値 + 授業の得点 × 5)`)、模試の機会の数えの更新、字幕と授業の行の削除を行う。
+        - 同時に 2 回呼ばれたときは、先に確定した呼び出しの結果を、後の呼び出しが返す (後の呼び出しは、授業の行が無く、記録が有るため)。
+        - 失敗したときは、502 を返す。何も記録しない。クライアントは、ボードの画像を持ち続け、「やり直す」で同じ呼び出しをもう一度行う。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [boardImage]
+              properties:
+                boardImage:
+                  type: string
+                  format: binary
+                  description: チャイムの時点のボード全体の画像 (PNG)
+      responses:
+        '200':
+          description: 記録したまとめノート
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LessonSummary'
+        '400':
+          $ref: '#/components/responses/InvalidBoardImage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: '`limit_not_reached`、`busy`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: |
+            LLM の失敗。`code` は `summary_failed`、`message` は「まとめノートを作れませんでした」。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /lessons/{lessonId}/abandon:
+    parameters:
+      - $ref: '#/components/parameters/LessonId'
+    post:
+      tags: [lessons]
+      operationId: abandonLesson
+      summary: 授業を中断する。記録せず、字幕を消す
+      description: |
+        画面を離れるときに、クライアントが `fetch` の `keepalive` で呼ぶ。すでに無い授業でも 204 を返す。
+        記録済みの授業には何もしない。処理中 (まとめ、応答、発話の認識) でも消す。
+        処理が後から終わっても、授業の行が無いため、その結果は記録も保存もされない (`createLessonSummary`、`replyLesson`、`sendLessonUtterance` を参照)。
+      responses:
+        '204':
+          description: 中断した (または、すでに無かった)
+
+  /mock-exams:
+    post:
+      tags: [mock-exams]
+      operationId: takeMockExam
+      summary: 模試に挑戦する (仕様書 5.7)
+      description: |
+        - 模試の機会が無いときは、409 `no_opportunity`。
+        - LLM を 1 回呼び、類題 1 問、解答用紙、生徒のコメントを作る。得点は、挑戦した時点の理解度。偏差値は `初期偏差値 + 理解度 ÷ 10` (小数第 1 位)。
+        - 成功したときだけ、結果を保存し、模試の機会を消して、数え直しを始める。
+        - 失敗したときは、502 `mock_exam_failed` (「模試を作れませんでした」) を返す。結果は保存せず、機会は残す。
+        - 同じ単元の挑戦が進行中のときは、409 `busy`。
+        - 材料の教材が削除されていて、使える問題が無いときは、単元の教科と単元名と AI 生徒の種類と得点だけを材料にして作る。
+      responses:
+        '201':
+          description: 保存した模試の結果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MockExamResult'
+        '409':
+          description: '`setup_required`、`no_opportunity`、`busy`'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '502':
+          description: LLM の失敗。`code` は `mock_exam_failed`
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /mock-exams/{mockExamId}:
+    parameters:
+      - name: mockExamId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [mock-exams]
+      operationId: getMockExam
+      summary: 保存済みの模試の結果を返す
+      responses:
+        '200':
+          description: 模試の結果。`history` は、同じ単元の模試の結果を古い順に並べた偏差値の推移
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MockExamResult'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /records/units:
+    get:
+      tags: [records]
+      operationId: listRecordUnits
+      summary: 授業の記録か模試の結果のある単元を返す (仕様書 5.8)
+      description: 現在の単元かどうかにかかわらず、利用者のすべての単元から選ぶ。並びは、単元の作成順。
+      responses:
+        '200':
+          description: 単元の一覧。記録が無いときは空の配列
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [units]
+                properties:
+                  units:
+                    type: array
+                    items:
+                      type: object
+                      required: [unitId, subject, unitName, lessonCount, mockExamCount]
+                      properties:
+                        unitId:
+                          type: string
+                          format: uuid
+                        subject:
+                          $ref: '#/components/schemas/Subject'
+                        unitName:
+                          type: string
+                        lessonCount:
+                          type: integer
+                          minimum: 0
+                        mockExamCount:
+                          type: integer
+                          minimum: 0
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /records/units/{unitId}:
+    parameters:
+      - $ref: '#/components/parameters/UnitId'
+    get:
+      tags: [records]
+      operationId: getRecordUnit
+      summary: 単元の画面の内容 (まとめノートの一覧、模試の結果の一覧、学習レポート) を返す
+      responses:
+        '200':
+          description: 単元の記録。一覧は新しい順
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordUnit'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+    delete:
+      tags: [records]
+      operationId: deleteRecordUnit
+      summary: 単元の学習記録を削除する (仕様書 5.9)
+      description: |
+        単元の授業の記録、まとめノート、模試の結果を消し、理解度を 0 に、模試の機会の数えを 0 に戻す。教材は残す。
+        1 つのトランザクションで行う。すでに記録が無くても 204 を返す。
+      responses:
+        '204':
+          description: 削除した (または、すでに記録が無かった)
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /records/notes/{recordId}:
+    parameters:
+      - name: recordId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [records]
+      operationId: getSummaryNote
+      summary: 保存済みのまとめノートを返す
+      responses:
+        '200':
+          description: まとめノート
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SummaryNote'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/SetupRequired'
+
+  /test/ai-script:
+    put:
+      tags: [test-control]
+      operationId: scriptAi
+      summary: フェイクの外部 AI サービスの、次の応答を決める
+      description: |
+        `aiMode` が `fake` のときだけ使える。呼んだ利用者 (Cookie) の分だけに効く。
+        `responses` は、`kind` の呼び出しごとに、先頭から 1 つずつ使う。使い切ったあとと、何も決めていないときは、
+        フェイクが決まった既定の成功の応答を返す (`defaults` を参照)。同じ `kind` を、もう一度 PUT すると、待ちの列を置き換える。
+        `repeat` が true のときは、`responses` の最後の 1 つを、使い切ったあとも返し続ける。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AiScript'
+            examples:
+              organizeFailsTwice:
+                summary: 整理が 2 回続けて失敗する
+                value:
+                  kind: organize
+                  responses:
+                    - { outcome: failure }
+                    - { outcome: failure }
+              recognizedText:
+                summary: 次の認識結果を決める
+                value:
+                  kind: stt
+                  responses:
+                    - { outcome: success, payload: { text: 二次関数の頂点は平方完成で求めます } }
+      responses:
+        '204':
+          description: 決めた
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [test-control]
+      operationId: resetAi
+      summary: 決めた応答と、呼び出しの数えを、すべて消す
+      responses:
+        '204':
+          description: 消した
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /test/ai-calls:
+    get:
+      tags: [test-control]
+      operationId: getAiCalls
+      summary: 外部 AI サービスの、`kind` ごとの呼び出しの回数を返す
+      description: 呼んだ利用者 (Cookie) の分だけを数える。費用の暴走を防げていること (上限を超えた呼び出しが無いこと) の確認に使う。
+      responses:
+        '200':
+          description: 呼び出しの回数
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [counts]
+                properties:
+                  counts:
+                    type: object
+                    description: 呼ばれていない `kind` は 0 とする
+                    properties:
+                      organize: { type: integer, minimum: 0 }
+                      student_reply: { type: integer, minimum: 0 }
+                      evaluation: { type: integer, minimum: 0 }
+                      mentor_reply: { type: integer, minimum: 0 }
+                      summary: { type: integer, minimum: 0 }
+                      mock_exam: { type: integer, minimum: 0 }
+                      homework: { type: integer, minimum: 0 }
+                      stt: { type: integer, minimum: 0 }
+                      tts: { type: integer, minimum: 0 }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /test/limits:
+    put:
+      tags: [test-control]
+      operationId: setTestLimits
+      summary: 授業と相談の時間の上限を、呼んだ利用者の分だけ短くする
+      description: |
+        既定は、授業と相談とも 600 秒。往復の上限 (授業 20、相談 15) は変えられない。
+        値は、このあと始める授業と相談から効く。進行中のものは変わらない。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                lessonSeconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 600
+                consultationSeconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 600
+      responses:
+        '204':
+          description: 決めた
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    MaterialId:
+      name: materialId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ImagePosition:
+      name: position
+      in: path
+      required: true
+      description: 教材の画像の番号 (1 から 3)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3
+    ConsultationId:
+      name: consultationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    LessonId:
+      name: lessonId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UtteranceId:
+      name: utteranceId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TurnId:
+      name: turnId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UnitId:
+      name: unitId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  requestBodies:
+    UtteranceAudio:
+      required: true
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [audio]
+            properties:
+              audio:
+                type: string
+                format: binary
+                description: |
+                  録音 (webm、mp4、wav のいずれか)。5 MB 以下 (60 秒の録音が入る大きさ)。
+                  `aiMode` が `fake` のときは、フロントエンドが固定の短い音声データを送り、フェイクの STT は中身を見ない。
+    ReplyMaterials:
+      required: true
+      content:
+        multipart/form-data:
+          schema:
+            type: object
+            required: [boardImage]
+            properties:
+              boardImage:
+                type: string
+                format: binary
+                description: 発話の時点のボード全体の画像 (PNG)。5 MB 以下
+              pointedRegions:
+                type: string
+                description: |
+                  指している範囲の JSON 文字列 (`Region` の配列。最大 10 件)。録音の開始前 10 秒から録音の終了までに、ペンが触れた範囲。
+                  触れていなければ、省略するか `[]`。
+                example: '[{"x":0.1,"y":0.2,"width":0.3,"height":0.1}]'
+
+  responses:
+    SetupRequired:
+      description: 設定が未完了。`code` は `setup_required`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: 対象が無い (または、ほかの利用者のもの)。`code` は `not_found`。`aiMode` が `real` のときの `/test/*` も同じ
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InvalidImage:
+      description: |
+        入力の誤り。`code` は `invalid_images` (文言: 「画像は 1 枚から 3 枚まで選んでください」か
+        「画像は JPEG か PNG で、1 枚 10 MB 以下にしてください」) か、`photo_not_confirmed`。
+        どちらも何も保存せず、外部へも送らない。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InvalidAudio:
+      description: 録音が空、または 5 MB を超える。`code` は `invalid_audio`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InvalidBoardImage:
+      description: ボードの画像が無い、PNG ではない、または 5 MB を超える。`code` は `invalid_board_image`
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UtteranceRecognized:
+      description: 認識の結果
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/UtteranceResult'
+    DialogueConflict:
+      description: |
+        授業や相談を続けられない。`code` は次のいずれか。
+        `setup_required`、`privacy_not_confirmed`、
+        `limit_reached` (往復の上限、または時間の上限に達している)、
+        `busy` (同じ授業または相談で、別の処理が進行中)、
+        `already_replied` (その発話には応答済み)、
+        `utterance_not_found` (未応答の最後の発話ではない。新しい発話で置き換えられた、または無い)。
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Audio:
+      description: 音声
+      content:
+        audio/mpeg:
+          schema:
+            type: string
+            format: binary
+    TtsFailed:
+      description: 音声の生成の失敗。`code` は `tts_failed`。クライアントは、字幕だけで続ける
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: 機械が見る識別子 (各 API の説明を参照)
+            message:
+              type: string
+              description: 画面に出してよい日本語の文言
+            fields:
+              type: object
+              additionalProperties:
+                type: string
+              description: 入力の誤りのときだけ。項目の名前から、その項目の文言への対応
+
+    Subject:
+      type: string
+      enum: [math, science]
+      description: math は「数学」、science は「理科」
+
+    StudentTypeId:
+      type: string
+      enum: [intuitive, diligent, logical]
+      description: intuitive は「直感・感覚派」、diligent は「真面目な暗記派」、logical は「論理・ツッコミ派」
+
+    TodayMode:
+      type: string
+      enum: [normal, self_study, homework_check]
+      description: normal は「通常」、self_study は「自習指示」、homework_check は「宿題の丸つけ」
+
+    Expression:
+      type: string
+      enum: [normal, troubled, convinced]
+      description: normal は「通常」、troubled は「困り」、convinced は「納得」。「考え中」(相槌のとき) はクライアントだけが使う
+
+    StudentType:
+      type: object
+      required: [id, displayName, initialDeviation, targetDeviation]
+      properties:
+        id:
+          $ref: '#/components/schemas/StudentTypeId'
+        displayName:
+          type: string
+        initialDeviation:
+          type: integer
+        targetDeviation:
+          type: integer
+
+    SettingsInput:
+      type: object
+      required: [studentTypeId, subject, unitName, lessonsPerWeek, privacyConfirmed]
+      properties:
+        studentTypeId:
+          $ref: '#/components/schemas/StudentTypeId'
+        subject:
+          $ref: '#/components/schemas/Subject'
+        unitName:
+          type: string
+          description: 前後の空白を除いて 1 文字以上 30 文字以内
+        lessonsPerWeek:
+          type: integer
+          minimum: 1
+          maximum: 7
+        privacyConfirmed:
+          type: boolean
+          description: 「氏名、学校名、連絡先は話さず、ボードにも書かないことを確認しました」のチェック。true でなければ保存しない
+
+    Settings:
+      type: object
+      required: [studentTypeId, subject, unitId, unitName, lessonsPerWeek, privacyConfirmed]
+      properties:
+        studentTypeId:
+          $ref: '#/components/schemas/StudentTypeId'
+        subject:
+          $ref: '#/components/schemas/Subject'
+        unitId:
+          type: string
+          format: uuid
+        unitName:
+          type: string
+        lessonsPerWeek:
+          type: integer
+          minimum: 1
+          maximum: 7
+        privacyConfirmed:
+          type: boolean
+
+    SettingsResponse:
+      type: object
+      required: [completed, settings]
+      properties:
+        completed:
+          type: boolean
+        settings:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Settings'
+          description: 未完了のときは null
+
+    Home:
+      type: object
+      required:
+        - student
+        - subject
+        - unitId
+        - unitName
+        - lessonsThisWeek
+        - lessonsPerWeek
+        - mockExamAvailable
+        - todayMode
+        - hasOrganizedMaterial
+      properties:
+        student:
+          $ref: '#/components/schemas/StudentType'
+        subject:
+          $ref: '#/components/schemas/Subject'
+        unitId:
+          type: string
+          format: uuid
+        unitName:
+          type: string
+        lessonsThisWeek:
+          type: integer
+          minimum: 0
+          description: 今週 (日本時間、月曜 0 時から) に記録した授業の回数。全単元を合わせる
+        lessonsPerWeek:
+          type: integer
+        mockExamAvailable:
+          type: boolean
+          description: 現在の単元に模試の機会があるか
+        todayMode:
+          $ref: '#/components/schemas/TodayMode'
+        hasOrganizedMaterial:
+          type: boolean
+          description: 現在の単元に、整理済みの教材が 1 つ以上あるか。false のとき「授業を始めるには、先生準備室で教材を登録してください」を出す
+
+    HomeworkResult:
+      type: object
+      required: [verdict, comment]
+      properties:
+        verdict:
+          type: string
+          enum: [correct, incorrect, undetermined]
+        comment:
+          type: string
+          description: 一言のコメント。`undetermined` のときは空でもよい
+
+    MaterialSummary:
+      type: object
+      required: [id, number, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        number:
+          type: integer
+          minimum: 1
+          description: 現在の単元の中での、登録順の番号 (「教材 1」)
+        status:
+          $ref: '#/components/schemas/MaterialStatus'
+
+    MaterialStatus:
+      type: string
+      enum: [organizing, organized, failed]
+      description: organizing は「整理中」、organized は「整理済み」、failed は「整理できませんでした」
+
+    MaterialDetail:
+      allOf:
+        - $ref: '#/components/schemas/MaterialSummary'
+        - type: object
+          properties:
+            problem:
+              nullable: true
+              allOf:
+                - $ref: '#/components/schemas/Problem'
+              description: '`status` が `organized` のときだけ入る。それ以外は null'
+
+    Problem:
+      type: object
+      required: [problemText, figures, modelAnswer, explanationSteps, studentWork, teachingPoints]
+      properties:
+        problemText:
+          type: string
+          description: 清書した問題文。図表は含めず、`figures` で別に持つ (図表を文字に置き換えない)
+        figures:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/Figure'
+          description: 問題の図表 (図形、グラフ、回路図など)。教材の画像の中の位置。無ければ空の配列。表示は、問題文の下に、この順で並べる
+        modelAnswer:
+          type: string
+        explanationSteps:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        studentWork:
+          type: string
+          description: 生徒の途中の解答
+        teachingPoints:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: string
+
+    Region:
+      type: object
+      description: 対象の画像全体 (ボードの画像、または教材の画像) に対する、0 以上 1 以下の割合で表した矩形。左上が原点
+      required: [x, y, width, height]
+      properties:
+        x: { type: number, minimum: 0, maximum: 1 }
+        y: { type: number, minimum: 0, maximum: 1 }
+        width: { type: number, minimum: 0, maximum: 1 }
+        height: { type: number, minimum: 0, maximum: 1 }
+
+    Figure:
+      type: object
+      description: |
+        問題の図表。教材の画像の 1 枚の中の、矩形の部分。LLM が、図表の位置を矩形で答え、サーバーが形を検査する。
+        画面は、`GET /materials/{materialId}/images/{position}` で画像を取り、`region` を切り出して表示する。
+        矩形の決まり: `x + width` と `y + height` は 1 以下、`width` と `height` は 0 より大きい。外れるときは、整理を失敗とみなす。
+      required: [imagePosition, region]
+      properties:
+        imagePosition:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: 教材の画像の番号 (1 から、教材の画像の枚数まで)
+        region:
+          $ref: '#/components/schemas/Region'
+
+    Turn:
+      type: object
+      required: [turnId, speaker, text]
+      properties:
+        turnId:
+          type: string
+          format: uuid
+        speaker:
+          type: string
+          enum: [student, mentor]
+        text:
+          type: string
+        expression:
+          $ref: '#/components/schemas/Expression'
+
+    UtteranceResult:
+      type: object
+      required: [recognized]
+      properties:
+        recognized:
+          type: boolean
+          description: 認識結果が 1 文字以上あるか。false のとき、`utteranceId` と `text` は無い
+        utteranceId:
+          type: string
+          format: uuid
+        text:
+          type: string
+
+    LessonStart:
+      type: object
+      required: [lessonId, startedAt, serverNow, deadlineAt, maxRounds, student, problemText, figures, studentWork, opening]
+      properties:
+        lessonId:
+          type: string
+          format: uuid
+        startedAt:
+          type: string
+          format: date-time
+        serverNow:
+          type: string
+          format: date-time
+          description: クライアントの時計とのずれを直すために使う
+        deadlineAt:
+          type: string
+          format: date-time
+          description: 開始から 600 秒後 (テストでは `PUT /test/limits` で短くできる)
+        maxRounds:
+          type: integer
+          enum: [20]
+        student:
+          $ref: '#/components/schemas/StudentType'
+        problemText:
+          type: string
+        figures:
+          type: array
+          items:
+            $ref: '#/components/schemas/Figure'
+          description: 問題文の下に置く図表 (`Problem.figures` と同じ)
+        studentWork:
+          type: string
+        opening:
+          $ref: '#/components/schemas/Turn'
+
+    LessonReply:
+      type: object
+      required: [turn, annotation, roundCount, limitReached]
+      properties:
+        turn:
+          $ref: '#/components/schemas/Turn'
+        annotation:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/StudentAnnotation'
+          description: ボードに示す箇所か「？」の印。無いときは null
+        roundCount:
+          type: integer
+          minimum: 1
+          maximum: 20
+          description: この応答を含めた往復の数
+        limitReached:
+          type: boolean
+          description: 往復が 20 に達した、または期限を過ぎたとき true。クライアントは、応答の字幕と音声が終わってからチャイムを鳴らす
+
+    StudentAnnotation:
+      type: object
+      required: [kind, region]
+      properties:
+        kind:
+          type: string
+          enum: [point, question_mark]
+          description: point は指し示し、question_mark は「？」の印を書き込む
+        region:
+          $ref: '#/components/schemas/Region'
+
+    LessonSummary:
+      type: object
+      required: [recordId, completedAt, summaryText, quotes, lessonsThisWeek]
+      properties:
+        recordId:
+          type: string
+          format: uuid
+        completedAt:
+          type: string
+          format: date-time
+        summaryText:
+          type: string
+        quotes:
+          type: array
+          items:
+            type: string
+          description: 引用する板書。利用者がボードに描いた図や式を、文章 (式は文字) で書き起こしたもの。0 件以上
+        lessonsThisWeek:
+          type: integer
+          minimum: 1
+
+    ConsultationStart:
+      type: object
+      required: [consultationId, startedAt, serverNow, deadlineAt, maxRounds, problemText, figures]
+      properties:
+        consultationId:
+          type: string
+          format: uuid
+        startedAt:
+          type: string
+          format: date-time
+        serverNow:
+          type: string
+          format: date-time
+        deadlineAt:
+          type: string
+          format: date-time
+        maxRounds:
+          type: integer
+          enum: [15]
+        problemText:
+          type: string
+        figures:
+          type: array
+          items:
+            $ref: '#/components/schemas/Figure'
+          description: 問題文の下に置く図表 (`Problem.figures` と同じ)
+
+    ConsultationReply:
+      type: object
+      required: [turn, boardWrites, roundCount, limitReached]
+      properties:
+        turn:
+          $ref: '#/components/schemas/Turn'
+        boardWrites:
+          type: array
+          items:
+            $ref: '#/components/schemas/BoardWrite'
+          description: ボードに書き込む図や式、ポイント。0 件以上
+        roundCount:
+          type: integer
+          minimum: 1
+          maximum: 15
+        limitReached:
+          type: boolean
+
+    BoardWrite:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [text, highlight]
+          description: text は文字の書き込み (式を含む)、highlight は範囲の強調
+        text:
+          type: string
+          description: '`kind` が `text` のときの内容'
+        region:
+          $ref: '#/components/schemas/Region'
+
+    MockExamResult:
+      type: object
+      required: [id, takenAt, score, deviation, problemText, answerSheet, studentComment, history]
+      properties:
+        id:
+          type: string
+          format: uuid
+        takenAt:
+          type: string
+          format: date-time
+        unitName:
+          type: string
+        score:
+          type: integer
+          minimum: 0
+          maximum: 100
+        deviation:
+          type: number
+          format: double
+          description: 小数第 1 位まで (例 69.0)
+        problemText:
+          type: string
+          description: 類題
+        answerSheet:
+          type: string
+          description: AI 生徒が書いた解答
+        studentComment:
+          type: string
+        history:
+          type: array
+          description: 同じ単元の模試の結果を、古い順に並べた偏差値の推移。1 件だけのときは 1 件
+          items:
+            type: object
+            required: [takenAt, deviation]
+            properties:
+              takenAt:
+                type: string
+                format: date-time
+              deviation:
+                type: number
+                format: double
+
+    SummaryNote:
+      type: object
+      required: [recordId, unitName, completedAt, summaryText, quotes]
+      properties:
+        recordId:
+          type: string
+          format: uuid
+        unitName:
+          type: string
+        completedAt:
+          type: string
+          format: date-time
+        summaryText:
+          type: string
+        quotes:
+          type: array
+          items:
+            type: string
+
+    RecordUnit:
+      type: object
+      required: [unitId, subject, unitName, notes, mockExams, report]
+      properties:
+        unitId:
+          type: string
+          format: uuid
+        subject:
+          $ref: '#/components/schemas/Subject'
+        unitName:
+          type: string
+        notes:
+          type: array
+          description: まとめノートの一覧 (新しい順)
+          items:
+            type: object
+            required: [recordId, completedAt]
+            properties:
+              recordId:
+                type: string
+                format: uuid
+              completedAt:
+                type: string
+                format: date-time
+        mockExams:
+          type: array
+          description: 模試の結果の一覧 (新しい順)
+          items:
+            type: object
+            required: [id, takenAt, score, deviation]
+            properties:
+              id:
+                type: string
+                format: uuid
+              takenAt:
+                type: string
+                format: date-time
+              score:
+                type: integer
+              deviation:
+                type: number
+                format: double
+        report:
+          $ref: '#/components/schemas/LearningReport'
+
+    LearningReport:
+      type: object
+      description: 理解度は含めない。LLM は使わず、保存済みの記録から集計する
+      required: [unitName, lessonCount, taughtProblemCount, latestMockExam]
+      properties:
+        unitName:
+          type: string
+        lessonCount:
+          type: integer
+          minimum: 0
+          description: 単元の授業の完了数の合計。0 のとき、画面は「まだ授業がありません」を出し、「画像を保存」を出さない
+        taughtProblemCount:
+          type: integer
+          minimum: 0
+          description: 授業に使った教材の数。同じ教材の重複は 1 つと数える
+        latestMockExam:
+          nullable: true
+          type: object
+          required: [score, deviation]
+          properties:
+            score:
+              type: integer
+            deviation:
+              type: number
+              format: double
+          description: 模試が無いときは null
+
+    AiScript:
+      type: object
+      required: [kind, responses]
+      properties:
+        kind:
+          type: string
+          enum: [organize, student_reply, evaluation, mentor_reply, summary, mock_exam, homework, stt, tts]
+        repeat:
+          type: boolean
+          default: false
+        responses:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [outcome]
+            properties:
+              outcome:
+                type: string
+                enum: [success, failure]
+              payload:
+                type: object
+                description: |
+                  `success` のときの中身。`kind` ごとの形は次のとおり。省略したときは、既定の成功の応答を使う。
+                  - `organize`: `Problem` と同じ形 (`figures` を含む。図表が無いときは空の配列)
+                  - `student_reply`: `{ text, expression, annotation }` (`annotation` は `StudentAnnotation` か null)
+                  - `evaluation`: `{ degrees: [0 から 2 の整数を 3 つ] }`
+                  - `mentor_reply`: `{ text, boardWrites }` (`BoardWrite` の配列)
+                  - `summary`: `{ summaryText, quotes }`
+                  - `mock_exam`: `{ problemText, answerSheet, studentComment }`
+                  - `homework`: `{ verdict, comment }` (`HomeworkResult` と同じ)
+                  - `stt`: `{ text }` (空の文字列なら、認識結果は空)
+                  - `tts`: 中身なし
+                additionalProperties: true
+      x-defaults: |
+        既定の成功の応答 (何も決めていないとき):
+        - `organize`: 問題「y = x^2 - 4x + 3 の頂点を求めなさい」、図表は無し (`figures: []`)、模範解答「頂点は (2, -1)」、解説の 1 ステップ「平方完成して頂点を読む」、
+          生徒の途中の解答「y = (x - 2)^2 と書いて手が止まっている」、指導のポイント 3 件
+        - `student_reply`: `{ text: "なぜそうなるのですか？", expression: "troubled", annotation: null }`
+        - `evaluation`: `{ degrees: [1, 1, 1] }`
+        - `mentor_reply`: `{ text: "ここは平方完成を使うと考えやすいですよ。", boardWrites: [] }`
+        - `summary`: `{ summaryText: "今日は頂点の求め方を教わりました。", quotes: [] }`
+        - `mock_exam`: `{ problemText: "y = x^2 - 6x + 5 の頂点を求めなさい", answerSheet: "平方完成して頂点を求めた", studentComment: "先生の説明で解けました" }`
+        - `homework`: `{ verdict: "correct", comment: "よくできました" }`
+        - `stt`: `{ text: "ここの式変形が分かりません" }`
+        - `tts`: 短い無音の音声
