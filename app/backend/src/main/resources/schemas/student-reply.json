@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["text", "expression", "annotation"],
+  "properties": {
+    "text": { "type": "string" },
+    "expression": { "type": "string", "enum": ["normal", "troubled", "convinced"] },
+    "annotation": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "region"],
+          "properties": {
+            "kind": { "type": "string", "enum": ["point", "question_mark"] },
+            "region": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["x", "y", "width", "height"],
+              "properties": {
+                "x": { "type": "number", "minimum": 0, "maximum": 1 },
+                "y": { "type": "number", "minimum": 0, "maximum": 1 },
+                "width": { "type": "number", "minimum": 0, "maximum": 1 },
+                "height": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

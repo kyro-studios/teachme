@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summaryText", "quotes"],
+  "properties": {
+    "summaryText": { "type": "string" },
+    "quotes": { "type": "array", "items": { "type": "string" } }
+  }
+}

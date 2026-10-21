@@ -8,6 +8,11 @@ export type Config = paths["/config"]["get"]["responses"][200]["content"]["appli
 
 export type SettingsResponse = components["schemas"]["SettingsResponse"];
 
+export type StudentTypesResponse =
+  paths["/student-types"]["get"]["responses"][200]["content"]["application/json"];
+
+export type Home = components["schemas"]["Home"];
+
 export const configQuery = queryOptions({
   queryKey: ["config"],
   queryFn: () => apiFetch<Config>("/config"),
@@ -16,4 +21,14 @@ export const configQuery = queryOptions({
 export const settingsQuery = queryOptions({
   queryKey: ["settings"],
   queryFn: () => apiFetch<SettingsResponse>("/settings"),
+});
+
+export const studentTypesQuery = queryOptions({
+  queryKey: ["student-types"],
+  queryFn: () => apiFetch<StudentTypesResponse>("/student-types"),
+});
+
+export const homeQuery = queryOptions({
+  queryKey: ["home"],
+  queryFn: () => apiFetch<Home>("/home"),
 });

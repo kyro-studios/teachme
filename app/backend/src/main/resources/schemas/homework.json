@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "comment"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["correct", "incorrect", "undetermined"] },
+    "comment": { "type": "string" }
+  }
+}
