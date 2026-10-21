@@ -28,6 +28,9 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -81,6 +84,14 @@ class MaterialOrganizerTest {
   /** 指導のポイントや図表の形を、形の不正な整理の結果にする。 */
   private static Map<String, Object> organizePayload(
       List<String> teachingPoints, List<Map<String, Object>> figures) {
+    return organizePayload(List.of("平方完成して頂点を読む"), teachingPoints, figures);
+  }
+
+  /** 解説や指導のポイントや図表の形を、形の不正な整理の結果にする。 */
+  private static Map<String, Object> organizePayload(
+      List<String> explanationSteps,
+      List<String> teachingPoints,
+      List<Map<String, Object>> figures) {
     return Map.of(
         "problemText",
         "y = x^2 - 4x + 3 の頂点を求めなさい",
@@ -89,7 +100,7 @@ class MaterialOrganizerTest {
         "modelAnswer",
         "頂点は (2, -1)",
         "explanationSteps",
-        List.of("平方完成して頂点を読む"),
+        explanationSteps,
         "studentWork",
         "y = (x - 2)^2 と書いて手が止まっている",
         "teachingPoints",
@@ -160,6 +171,42 @@ class MaterialOrganizerTest {
   }
 
   @Test
+  void 解説が空の応答は_失敗として_やり直す() throws InterruptedException {
+    fakeAi.script(
+        USER,
+        AiCallKind.ORGANIZE,
+        List.of(
+            new ScriptedResponse(
+                true, organizePayload(List.of(), List.of("a", "b", "c"), List.of())),
+            new ScriptedResponse(true, null)),
+        false);
+
+    MaterialView created = service.create(USER, List.of(png()));
+
+    Await.until("整理済み", () -> statusOf(created.id()) == MaterialStatus.ORGANIZED);
+    assertEquals(2, organizeCalls());
+  }
+
+  @Test
+  void 解説が空の応答が_2_回続くと_整理できませんでしたになり_結果は残らない() throws InterruptedException {
+    fakeAi.script(
+        USER,
+        AiCallKind.ORGANIZE,
+        List.of(
+            new ScriptedResponse(
+                true, organizePayload(List.of(), List.of("a", "b", "c"), List.of())),
+            new ScriptedResponse(
+                true, organizePayload(List.of(), List.of("a", "b", "c"), List.of()))),
+        false);
+
+    MaterialView created = service.create(USER, List.of(png()));
+
+    Await.until("整理できませんでした", () -> statusOf(created.id()) == MaterialStatus.FAILED);
+    assertEquals(2, organizeCalls());
+    assertNull(service.find(USER, created.id()).orElseThrow().problem());
+  }
+
+  @Test
   void 図表の矩形が範囲の外の応答も_形の不正として_やり直す() throws InterruptedException {
     fakeAi.script(
         USER,
@@ -214,7 +261,7 @@ class MaterialOrganizerTest {
   }
 
   @Test
-  void 整理できなかった教材を_二重に_やり直すと_2_回目は_409_になる() throws InterruptedException {
+  void 整理できなかった教材を_やり直し中に_もう一度やり直すと_2_回目は_409_になり_整理は起動しない() throws InterruptedException {
     fakeAi.script(
         USER,
         AiCallKind.ORGANIZE,
@@ -223,14 +270,63 @@ class MaterialOrganizerTest {
     MaterialView created = service.create(USER, List.of(png()));
     Await.until("整理できませんでした", () -> statusOf(created.id()) == MaterialStatus.FAILED);
 
-    // 1 回目のやり直しは受け付け、整理が終わるまで待つ。終わるとまた failed ではなくなる
-    service.retry(USER, created.id());
-    Await.until("整理済み", () -> statusOf(created.id()) == MaterialStatus.ORGANIZED);
+    // やり直しの整理は、LLM の応答の前で止めておき、そこへ 2 回目のやり直しを送る
+    CountDownLatch entered = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    AtomicInteger started = new AtomicInteger();
+    MaterialOrganizer blocking =
+        new MaterialOrganizer(
+            repositories.materials(), blockingOrganize(started, entered, release), clock);
+    MaterialService retrying =
+        new MaterialService(
+            new SettingsService(repositories.settings(), clock),
+            repositories.materials(),
+            blocking,
+            clock);
+    try {
+      // 1 回目のやり直しは受け付け、整理を始める
+      retrying.retry(USER, created.id());
+      assertTrue(entered.await(10, TimeUnit.SECONDS));
 
-    ConflictException error =
-        assertThrows(ConflictException.class, () -> service.retry(USER, created.id()));
-    assertEquals("material_not_failed", error.code());
+      ConflictException error =
+          assertThrows(ConflictException.class, () -> retrying.retry(USER, created.id()));
+      assertEquals("material_not_failed", error.code());
+      assertEquals(MaterialStatus.ORGANIZING, statusOf(created.id()));
+      assertEquals(1, started.get());
+    } finally {
+      release.countDown();
+      blocking.close();
+    }
+
+    Await.until("整理済み", () -> statusOf(created.id()) == MaterialStatus.ORGANIZED);
     assertEquals(3, organizeCalls());
+  }
+
+  /**
+   * 整理の呼び出しを数え、{@code release} が開くまで止める LLM。ほかの呼び出しは、フェイクに任せる。
+   *
+   * @param started 整理の呼び出しを始めた数
+   * @param entered 最初の呼び出しが止まったときに開く
+   * @param release 止めた呼び出しを続けさせるために開く
+   */
+  private LanguageModel blockingOrganize(
+      AtomicInteger started, CountDownLatch entered, CountDownLatch release) {
+    return (LanguageModel)
+        Proxy.newProxyInstance(
+            LanguageModel.class.getClassLoader(),
+            new Class<?>[] {LanguageModel.class},
+            (proxy, method, args) -> {
+              if (method.getName().equals("organize")) {
+                started.incrementAndGet();
+                entered.countDown();
+                release.await();
+              }
+              try {
+                return method.invoke(fakeAi, args);
+              } catch (InvocationTargetException e) {
+                throw e.getCause();
+              }
+            });
   }
 
   @Test

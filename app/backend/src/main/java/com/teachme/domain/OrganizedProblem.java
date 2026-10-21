@@ -6,8 +6,8 @@ import java.util.Optional;
 /**
  * 教材の整理の結果 (仕様書 5.3、6 節。アーキテクチャ設計 4.2)。
  *
- * <p>形を外れる結果は、{@link #parse} で無効とする。指導のポイントは 3 件、図表は 5 件以下で、図表の画像の番号は教材の画像の枚数の範囲、矩形は画像の中に収まること。
- * 文字列の項目は、null を許さない (保存先の列が null を受け付けないため)。
+ * <p>形を外れる結果は、{@link #parse} で無効とする。解説は 1 件以上、指導のポイントは 3 件、図表は 5
+ * 件以下で、図表の画像の番号は教材の画像の枚数の範囲、矩形は画像の中に収まること。 文字列の項目は、null を許さない (保存先の列が null を受け付けないため)。
  */
 public final class OrganizedProblem {
 
@@ -58,6 +58,7 @@ public final class OrganizedProblem {
         || studentWork == null
         || figures == null
         || explanationSteps == null
+        || explanationSteps.isEmpty()
         || teachingPoints == null
         || teachingPoints.size() != TEACHING_POINT_COUNT
         || containsNull(teachingPoints)

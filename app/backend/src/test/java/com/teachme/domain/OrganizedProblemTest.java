@@ -50,6 +50,11 @@ class OrganizedProblemTest {
   }
 
   @Test
+  void 解説が_空のときは無効() {
+    assertTrue(OrganizedProblem.parse("問題", List.of(), "答え", List.of(), "途中", POINTS, 1).isEmpty());
+  }
+
+  @Test
   void 指導のポイントに_null_が入るときは無効() {
     List<String> withNull = Arrays.asList("a", null, "c");
 
