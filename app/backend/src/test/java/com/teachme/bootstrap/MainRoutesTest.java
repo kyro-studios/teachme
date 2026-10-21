@@ -52,7 +52,13 @@ class MainRoutesTest {
 
   @Test
   void real_のときは_テスト用の_API_を登録せず_404_を返す() {
-    AppConfig config = AppConfig.fromEnv(Map.of("AI_MODE", "real"));
+    AppConfig config =
+        AppConfig.fromEnv(
+            Map.of(
+                "AI_MODE", "real",
+                "LLM_API_KEY", "test-key",
+                "LLM_MODEL_ORGANIZE", "organize-model",
+                "LLM_MODEL_DIALOGUE", "dialogue-model"));
 
     JavalinTest.test(
         WebApp.create(Optional.empty(), Main.routes(config, WITHOUT_DATABASE)),
