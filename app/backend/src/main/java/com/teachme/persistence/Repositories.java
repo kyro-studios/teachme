@@ -12,6 +12,7 @@ public final class Repositories {
   private final TodayModeRepository todayModes;
   private final LessonRecordRepository lessonRecords;
   private final UnitRepository units;
+  private final DialogueRepository dialogues;
 
   public Repositories(DataSource dataSource) {
     DSLContext dsl = DSL.using(dataSource, SQLDialect.POSTGRES);
@@ -19,6 +20,7 @@ public final class Repositories {
     this.todayModes = new TodayModeRepository(dsl);
     this.lessonRecords = new LessonRecordRepository(dsl);
     this.units = new UnitRepository(dsl);
+    this.dialogues = new DialogueRepository(dsl);
   }
 
   public SettingsRepository settings() {
@@ -35,5 +37,9 @@ public final class Repositories {
 
   public UnitRepository units() {
     return units;
+  }
+
+  public DialogueRepository dialogues() {
+    return dialogues;
   }
 }

@@ -32,7 +32,8 @@ public final class SettingsRepository {
             USER_SETTINGS.LESSONS_PER_WEEK,
             UNITS.ID,
             UNITS.SUBJECT,
-            UNITS.NAME)
+            UNITS.NAME,
+            USER_SETTINGS.PRIVACY_CONFIRMED)
         .from(USER_SETTINGS)
         .join(UNITS)
         .on(UNITS.ID.eq(USER_SETTINGS.CURRENT_UNIT_ID))
@@ -44,7 +45,8 @@ public final class SettingsRepository {
                     Subject.fromId(row.get(UNITS.SUBJECT)).orElseThrow(),
                     row.get(UNITS.ID),
                     row.get(UNITS.NAME),
-                    row.get(USER_SETTINGS.LESSONS_PER_WEEK).intValue()));
+                    row.get(USER_SETTINGS.LESSONS_PER_WEEK).intValue(),
+                    row.get(USER_SETTINGS.PRIVACY_CONFIRMED)));
   }
 
   /**
@@ -97,7 +99,8 @@ public final class SettingsRepository {
               .set(USER_SETTINGS.PRIVACY_CONFIRMED, true)
               .set(USER_SETTINGS.UPDATED_AT, updated)
               .execute();
-          return new UserSettings(studentType, subject, unitId, unitName.value(), lessonsPerWeek);
+          return new UserSettings(
+              studentType, subject, unitId, unitName.value(), lessonsPerWeek, true);
         });
   }
 }
