@@ -14,7 +14,7 @@
 | --- | --- |
 | `app/frontend` の `pages` | 画面 (初期セットアップ、ホーム、先生準備室、教材の詳細、相談、授業、まとめノート、模試の結果、学習記録、単元の記録) |
 | `app/frontend` の `features` | `setup`、`home`、`materials`、`consultation`、`lesson`、`mock-exam`、`records` の 7 つ |
-| `app/frontend` の `shared` | `ui`、`board` (tldraw)、`avatar` (Live2D)、`audio` (録音と再生)、`image-export` (PNG の書き出し)、`lib` |
+| `app/frontend` の `shared` | `ui`、`board` (tldraw。図表の切り出しを含む)、`avatar` (Live2D)、`audio` (録音と再生)、`image-export` (PNG の書き出し)、`lib` |
 | `app/frontend` の `api` | API のクライアントと、`openapi.yaml` から生成した型 |
 | `app/backend` の `domain` | 規則 (理解度、偏差値、授業の得点、上限、週の範囲、AI 生徒の種類) |
 | `app/backend` の `ai` | 外部 AI のポート。`ai.real` が実際の API、`ai.fake` がテスト用のフェイク |
@@ -113,6 +113,8 @@ sequenceDiagram
     F->>F: ペンが離れて 2 秒たつまで待ち、字幕と音声を出す
 ```
 
+応答の受け付けと確定は、4.4 の決まりに従う (未応答の発話は 1 件、開始時の上限と期限の検査、授業の行を `for update` で取ってから書く)。
+
 ### 2.3 教材の整理 (非同期)
 
 ```mermaid
@@ -126,7 +128,7 @@ sequenceDiagram
     B-->>F: 202 (organizing)
     B->>E: 整理を依頼
     E->>L: 整理 (1 回目)
-    alt 失敗、またはポイントが 3 件ではない
+    alt 失敗、ポイントが 3 件ではない、または図表の形が不正
         E->>L: 整理 (自動の 2 回目。これが最後)
     end
     E->>E: 状態が organizing のままなら、organized か failed に更新
@@ -161,7 +163,7 @@ sequenceDiagram
 | 今日のモード | `domain.TodayMode`。`application.HomeService` | `today_modes` (モードと日付。今日と違えば、通常として読む) |
 | 今週の授業 | `domain.WeekRange` (月曜 0 時から、日本時間)。`application.HomeService` | 保存しない。`lesson_records` を、今週の範囲で数える |
 | 教材 | `application.MaterialService`、`MaterialOrganizer` | `materials` と `material_images` |
-| 問題、模範解答、解説、生徒の途中の解答、指導のポイント | `domain.OrganizedProblem` (ポイントが 3 件であることを検査する) | `materials` の列 (`problem_text`、`model_answer`、`explanation_steps`、`student_work`、`teaching_points`)。教材 1 つに問題は 1 問 |
+| 問題、図表、模範解答、解説、生徒の途中の解答、指導のポイント | `domain.OrganizedProblem` (ポイントが 3 件であることと、図表の矩形の形を検査する) | `materials` の列 (`problem_text`、`figures`、`model_answer`、`explanation_steps`、`student_work`、`teaching_points`)。教材 1 つに問題は 1 問 |
 | 授業 | `application.LessonService`。上限は `domain.DialogueLimits` | `lessons` (進行中だけ。記録されると消える) |
 | 先輩先生への相談 | `application.ConsultationService`。上限は `domain.DialogueLimits` | `consultations` (進行中だけ) |
 | ボード | フロントエンドの `shared/board` (tldraw) | サーバーには保存しない。発話ごとの画像を、外部 AI に渡すためだけに受け取る |
@@ -188,7 +190,7 @@ sequenceDiagram
 | `SettingsService` | `GET /settings`、`PUT /settings`、`GET /student-types` |
 | `HomeService` | `GET /home`、`PUT /today-mode` |
 | `HomeworkService` | `POST /homework-checks` |
-| `MaterialService`、`MaterialOrganizer` | `GET/POST /materials`、`GET/DELETE /materials/{id}`、`POST /materials/{id}/retry` |
+| `MaterialService`、`MaterialOrganizer` | `GET/POST /materials`、`GET/DELETE /materials/{id}`、`POST /materials/{id}/retry`、`GET /materials/{id}/images/{position}` |
 | `ConsultationService` | `/consultations` の 5 つの API |
 | `LessonService` | `/lessons` の 6 つの API (開始、発話、応答、音声、まとめ、中断) |
 | `MockExamService` | `POST /mock-exams`、`GET /mock-exams/{id}` |
@@ -209,7 +211,7 @@ sequenceDiagram
 | `Deviation` | `初期偏差値 + 理解度 ÷ 10` を、`BigDecimal` で、小数第 1 位に四捨五入する (理解度は整数のため、結果は常に小数第 1 位までで、丸めで値は変わらない) |
 | `MockExamOpportunity` | 授業の完了が 3 回で機会あり。結果の保存で 0 に戻す |
 | `WeekRange` | 日本時間の月曜 0 時から日曜 24 時 |
-| `OrganizedProblem` | 整理の結果。指導のポイントが 3 件でなければ、無効とする |
+| `OrganizedProblem` | 整理の結果。次の形を外れれば、無効とする。指導のポイントが 3 件。図表は 5 件以下で、`imagePosition` が 1 から教材の画像の枚数まで、矩形の `x`、`y` が 0 以上、`width`、`height` が 0 より大きく、`x + width`、`y + height` が 1 以下 |
 | `UnitName` | 前後の空白を除いて 1 文字以上 30 文字以内 |
 
 ### 4.3 外部 AI のポート (`ai`)
@@ -218,7 +220,7 @@ sequenceDiagram
 
 | メソッド | 呼び出し元 | 入力 | 出力 |
 | --- | --- | --- | --- |
-| `organize` | `MaterialOrganizer` | 教材の画像 (1 枚から 3 枚) | 問題文、模範解答、解説のステップ、生徒の途中の解答、指導のポイント (`OrganizedProblem` の元) |
+| `organize` | `MaterialOrganizer` | 教材の画像 (1 枚から 3 枚) | 問題文、図表 (教材の画像の番号と矩形)、模範解答、解説のステップ、生徒の途中の解答、指導のポイント (`OrganizedProblem` の元) |
 | `studentReply` | `LessonService` | 生徒の種類、問題文、生徒の途中の解答、ボードの画像、発話、これまでの字幕、指している範囲 | 応答の文章、表情、`StudentAnnotation` |
 | `evaluate` | `LessonService` | 指導のポイント 3 件、模範解答、解説、問題文、ボードの画像、発話、これまでの字幕、指している範囲 | 3 件の度合い |
 | `mentorReply` | `ConsultationService` | 問題、模範解答、解説、指導のポイント、ボードの画像、発話、これまでの字幕、指している範囲 | 応答の文章、`boardWrites` |
@@ -252,17 +254,24 @@ sequenceDiagram
 - 開始: `lessons` か `consultations` に行を作る。開始時刻と期限 (開始から 600 秒、または `PUT /test/limits` の値) をサーバーが決める。同じ利用者の、進行中の同じ種類の行は、先に消す (中断)。
 - 処理中の印: `busy_since` 列を使う。発話、応答、まとめの処理の前に、`UPDATE ... SET busy_since = now WHERE id = ? AND user_id = ? AND (busy_since IS NULL OR busy_since < now - 90 秒)` を行う。更新できなければ 409 `busy`。処理の終わりに、`busy_since` を NULL に戻す。90 秒を過ぎた印は、異常終了の名残として無視する。
 - 発話 (STT) の受け付けの条件: `round_count < 上限`、かつ `now < deadline_at`。満たさなければ、録音を捨てて 409 `limit_reached`。
-- 応答の受け付けの条件: 発話が、この授業か相談の認識済みの利用者の字幕で、まだ応答していない (`replied = false`)。期限は見ない (応答の途中で期限に達しても、応答を終えるため)。応答に成功したら、字幕を保存し、`round_count` を 1 増やし、`replied` を true にし、授業では度合いを更新する。1 つのトランザクションで行う。
+  - 認識が成功したら、同じ 1 つのトランザクションで、未応答の利用者の字幕 (`replied = false`) を消してから、新しい字幕を入れる。未応答の字幕は、授業か相談ごとに常に 1 件以下になる。認識の結果が空のときは、何も入れない。
+  - STT の完了の時点で親の行が無ければ (中断された後)、結果を捨てて 404 を返す。
+  - 処理中の印 (`busy_since`) で、STT と応答は同時に 1 件だけ進む。応答が失敗して未応答の字幕が残ったあとの新しい発話は、その字幕を置き換える。
+- 応答の受け付けの条件: (a) 発話が、この授業か相談の未応答の字幕として残っている (`replied = false`)。応答済みは `already_replied`、置き換えられていれば `utterance_not_found`。(b) 受け付けの時点で `round_count < 上限`、かつ `now < deadline_at`。満たさなければ 409 `limit_reached`。
+  - (b) は受け付けの時点だけ見る。受け付けた 1 往復は、応答の途中で期限に達しても終える。期限をまたいで完了するのは、この 1 往復に限る。期限を過ぎてから受け付けることは無い。
+  - 応答に成功したら、親の行を `for update` で取り、まだ残っていれば、字幕を保存し、`round_count` を 1 増やし、`replied` を true にし、授業では度合いを更新する。1 つのトランザクションで行う。親の行が無ければ (中断された後)、結果を捨てて 404 を返す。
 - 学習評価だけが失敗したときは、度合いを変えずに、応答を返す。
-- まとめの受け付けの条件: `round_count >= 20`、または `now >= deadline_at - 3 秒` (クライアントの時計のずれを許す猶予)。
-- まとめの成功: 1 つのトランザクションで、`lesson_records` の挿入 (`id` は授業の識別子)、`units.understanding` の更新、`units.lessons_since_exam` の加算、`lessons` と `dialogue_turns` の削除を行う。2 回目以降の同じ授業のまとめの呼び出しは、`lesson_records` から保存済みの結果を返し、LLM を呼ばない。
+- まとめの受け付けの条件: 同じ授業の記録 (`lesson_records`) が既にあれば、LLM を呼ばず、保存済みの結果を返す。無ければ、`round_count >= 20`、または `now >= deadline_at - 3 秒` (クライアントの時計のずれを許す猶予)。
+- まとめの成功: 親の行 (`lessons`) を `for update` で取る。行が無ければ (LLM の呼び出しの間に中断された)、結果を捨てて 404 を返し、記録しない。行があれば、1 つのトランザクションで、`lesson_records` の挿入 (`id` は授業の識別子)、`units.understanding` の更新、`units.lessons_since_exam` の加算、`lessons` と `dialogue_turns` の削除を行う。同時に 2 回呼ばれたときは、先に確定したほうが記録を残し、後の呼び出しは、行が無く記録が有るため、保存済みの結果を返す。
+- 中断と確定の排他: 中断 (`abandon`) は親の行を削除する。発話、応答、まとめの確定は、いずれも親の行を `for update` で取ってから書くため、中断と並んだときは、どちらか一方が先に終わる。中断が先なら、後の確定は行が無く、結果を捨てる (記録も字幕も残さない)。応答や発話の確定が先なら、中断は進行中の行と字幕を消す (記録は残らない、5.5 の中断どおり)。まとめの確定が先なら、授業の行は確定の時点で消えているため、中断は何もせず、記録は残る。
+  - 中断の API は、処理中 (`busy_since` が立っている) でも行を消す。処理中の呼び出しは、確定の時点で行が無いことを見て、結果を捨てる。
 - 音声 (TTS): 字幕の行 1 つにつき、最大 1 回だけ生成する。`audio_attempted` を先に true にしてから呼び、失敗したら 502 を返す。生成した音声は `audio` に持ち、再度の取得に使う。字幕と一緒に消える。
 - 掃除: バックエンドが、10 分ごとに、開始から 60 分を過ぎた `lessons` と `consultations` (字幕を含む) を消す。中断の通知が届かなかった場合の保険である。
 
 ### 4.5 教材の整理 (`MaterialOrganizer`)
 
 - 登録の API は、画像を保存して状態を `organizing` にし、`organize_started_at` を記録して、すぐに 202 を返す。整理は、同じプロセスの固定 2 スレッドのワーカーで行う。
-- ワーカーは、`organize` を呼び、失敗か、指導のポイントが 3 件ではないときは、1 回だけやり直す。2 回とも失敗なら `failed` にする。
+- ワーカーは、`organize` を呼び、失敗か、指導のポイントが 3 件ではないか、図表の形が不正 (4.2 の `OrganizedProblem`) のときは、1 回だけやり直す。2 回とも失敗なら `failed` にする。
 - 状態の更新は、`WHERE status = 'organizing'` の条件付きで行う。教材が整理中に削除されたときや、再試行が重なったときに、結果を捨てる。
 - 「やり直す」は、`UPDATE ... SET status = 'organizing' WHERE id = ? AND status = 'failed'` が 1 行更新できたときだけ、ワーカーに依頼する。更新できなければ 409 `material_not_failed`。整理中に二重に始まらない。
 - バックエンドの起動時と、10 分ごとの掃除で、`organize_started_at` から 10 分を過ぎた `organizing` の教材を、`failed` にする (インスタンスの停止で整理が途切れた場合の保険。利用者は「やり直す」で再開できる)。
@@ -296,7 +305,7 @@ URL は、受け入れテストを書く段階で決める。次は、画面と 
 | `idle` | 発話待ち | 「話す」で `recording` |
 | `recording` | 録音中 | 「話し終える」か 60 秒で `transcribing`。上限で、録音を捨てて `chime` |
 | `transcribing` | 認識中 | 結果が空か失敗なら、「うまく聞き取れませんでした。もう一度話してください」を出して `idle`。認識できたら、相槌と字幕を出して `awaitingReply` |
-| `awaitingReply` | 応答中 | 応答の API の結果を待つ。失敗なら「生徒の応答を作れませんでした。もう一度話してください」を出して `idle`。成功なら `holding` |
+| `awaitingReply` | 応答中 | 応答の API の結果を待つ。失敗なら「生徒の応答を作れませんでした。もう一度話してください」を出して `idle`。成功なら `holding`。409 `limit_reached` (認識の後に期限に達していた) なら、応答を出さずに `chime`。そのほかの 409 は、失敗と同じく `idle` |
 | `holding` | 応答待ち | ペンが触れている間と、離してから 2 秒の間は、字幕も音声も出さず、頷くだけ (表情は通常)。過ぎたら `speaking` |
 | `speaking` | 生徒の発話 | 字幕、表情、書き込みを出し、音声を再生する。音声が失敗したら字幕だけ。終わったら、上限に達していなければ `idle`、達していれば `chime` |
 | `chime` | チャイム | 「チャイムが鳴りました。授業のまとめに入ります」を出し、書き込み中でなければ音を鳴らす。`summarizing` へ |
@@ -313,6 +322,9 @@ URL は、受け入れテストを書く段階で決める。次は、画面と 
 ### 5.3 ボード、録音、キャラクター
 
 - ボード (`shared/board`): tldraw を包む。初期配置 (「問題」「生徒のノート」の見出しと内容) は、`lesson` が、授業の開始の結果から作って渡す。
+  - 図表 (`figures`): 図表は文字に置き換えず、教材の画像の一部を切り出して、問題文の下に、順に置く。切り出しは `shared/board` の関数が行う。`GET /materials/{id}/images/{position}` で画像を取り、`region` の割合の矩形を、canvas に描いて PNG にし、tldraw の画像の図形として置く。幅は問題の欄に収め、縦に並べる。
+  - この方式にした理由は 9 節。サーバーは画像を加工せず、切り出しは表示のたびに、端末で行う。ボードに置いた図表は、ボードの画像として AI 生徒と先輩先生に渡るため、図表の内容も材料になる。
+  - 教材の詳細も、同じ関数で図表を表示する (`features/materials`)。
   - ペンの状態: ボードの要素に対するポインターイベント (`pointerdown`、`pointerup`、`pointercancel`) で、書き込み中かどうかと、最後にペンを離した時刻を追跡する。ペン、指、マウスのどれでも「触れている」とみなす (受け入れテストはマウスで行える)。`touch-action: none` をボードに設定する。
   - 指している範囲: ペンが触れたストロークごとに、時刻とボード全体に対する割合の矩形を記録する。録音を始める 10 秒前から録音を終えるまでの矩形を、最大 10 件 (新しいものを優先) で返す。
   - ボードの画像: tldraw の画像の書き出しで PNG を作る。長辺を 1280 px 以下に縮小してから送る (費用の抑制)。
@@ -336,7 +348,7 @@ URL は、受け入れテストを書く段階で決める。次は、画面と 
 | system | `GET /config`、`GET /healthz` | 2.4 (フェイク)、運用 |
 | setup | `GET /student-types`、`GET /settings`、`PUT /settings` | 5.1 |
 | home | `GET /home`、`PUT /today-mode`、`POST /homework-checks` | 5.2 |
-| materials | `GET /materials`、`POST /materials`、`GET /materials/{materialId}`、`DELETE /materials/{materialId}`、`POST /materials/{materialId}/retry` | 5.3、5.9 |
+| materials | `GET /materials`、`POST /materials`、`GET /materials/{materialId}`、`DELETE /materials/{materialId}`、`POST /materials/{materialId}/retry`、`GET /materials/{materialId}/images/{position}` | 5.3、5.9 |
 | consultations | `POST /consultations`、`POST /consultations/{id}/utterances`、`POST /consultations/{id}/utterances/{utteranceId}/reply`、`GET /consultations/{id}/turns/{turnId}/audio`、`POST /consultations/{id}/abandon` | 5.4 |
 | lessons | `POST /lessons`、`POST /lessons/{id}/utterances`、`POST /lessons/{id}/utterances/{utteranceId}/reply`、`GET /lessons/{id}/turns/{turnId}/audio`、`POST /lessons/{id}/summary`、`POST /lessons/{id}/abandon` | 5.5、5.6 |
 | mock-exams | `POST /mock-exams`、`GET /mock-exams/{mockExamId}` | 5.7 |
@@ -403,6 +415,7 @@ erDiagram
         text status
         timestamptz organize_started_at
         text problem_text
+        jsonb figures
         text model_answer
         jsonb explanation_steps
         text student_work
@@ -480,11 +493,11 @@ erDiagram
 | `user_settings` | 設定が完了した利用者だけが行を持つ。行が無ければ「未完了」。`student_type` は `intuitive`、`diligent`、`logical`。`lessons_per_week` は 1 から 7。`privacy_confirmed` は、保存の時点で true のものだけを入れる (check 制約で true に固定) |
 | `units` | `subject` は `math` か `science`。`name` は 30 文字以内。`unique (user_id, subject, name)`。`understanding` は 0 から 100 の整数 (初期値 0)。`lessons_since_exam` は、前回の模試の結果の保存後 (最初は最初から) の授業の完了数 |
 | `today_modes` | `mode` は `normal`、`self_study`、`homework_check`。`mode_date` が今日 (日本時間) でなければ、通常として読む |
-| `materials` | `status` は `organizing`、`organized`、`failed`。整理の結果の列は、`organized` のときだけ値を持つ。教材の番号 (「教材 1」) は、同じ単元の中で `created_at` の順に数えて、表示のたびに求める。`unit_id` は `on delete cascade` |
+| `materials` | `status` は `organizing`、`organized`、`failed`。整理の結果の列 (`problem_text`、`figures` など) は、`organized` のときだけ値を持つ。`figures` は、図表の `imagePosition` と `region` の配列 (5 件まで。空配列のこともある)。教材の番号 (「教材 1」) は、同じ単元の中で `created_at` の順に数えて、表示のたびに求める。`unit_id` は `on delete cascade` |
 | `material_images` | 教材の画像 (1 枚から 3 枚) を `bytea` で持つ。`material_id` は `on delete cascade`。教材の削除で一緒に消える。`unique (material_id, position)` |
 | `lessons` | 進行中の授業だけ。`degrees` は 3 つの 0 から 2 の整数の配列 (初期値は 0 が 3 つ)。`material_id` は `on delete cascade` (整理中の削除などで教材が消えたら、授業も消える) |
 | `consultations` | 進行中の相談だけ |
-| `dialogue_turns` | 進行中の授業か相談の字幕。`lesson_id` か `consultation_id` のどちらか一方だけが入る (check 制約)。`speaker` は `user`、`student`、`mentor`。`body` は字幕の文章。`expression` は生徒の応答のとき。`extras` は、生徒の `annotation` か、先輩先生の `boardWrites`。`replied` は、利用者の字幕に応答したか。`audio` は、生成した音声。`unique (lesson_id, seq)` と `unique (consultation_id, seq)`。親の `on delete cascade` |
+| `dialogue_turns` | 進行中の授業か相談の字幕。`lesson_id` か `consultation_id` のどちらか一方だけが入る (check 制約)。`speaker` は `user`、`student`、`mentor`。`body` は字幕の文章。`expression` は生徒の応答のとき。`extras` は、生徒の `annotation` か、先輩先生の `boardWrites`。`replied` は、利用者の字幕に応答したか。未応答 (`replied = false`) の利用者の字幕は、授業か相談ごとに 1 件まで (新しい発話で置き換える、4.4)。`audio` は、生成した音声。`unique (lesson_id, seq)` と `unique (consultation_id, seq)`。親の `on delete cascade` |
 | `lesson_records` | 授業 1 回の記録とまとめノート。`id` は授業の識別子と同じ。`material_ref` は教材の識別子を持つが、外部キーにしない (教材を削除しても、記録と、教えた問題の数を残すため)。`degrees` は、3 件の最大値。`quotes` は、引用する板書の文章の配列。`unit_id` は `on delete cascade` |
 | `mock_exams` | 結果が保存されたときだけ行を作る。`score` は 0 から 100。`deviation` は `numeric(4,1)`。`unit_id` は `on delete cascade` |
 
@@ -496,8 +509,9 @@ erDiagram
 | --- | --- |
 | 設定の保存 | `users` (無ければ)、`units` (同名があれば再利用)、`user_settings` の挿入か更新 |
 | 教材の登録 | `materials` (`organizing`) と `material_images` |
-| 応答の成功 | `dialogue_turns` に利用者の字幕の `replied = true` と応答の字幕、`round_count + 1`、授業では `degrees` を要素ごとの `greatest` で更新 |
-| まとめの成功 | `lesson_records` の挿入、`units.understanding` を `least(100, 前 + 得点 × 5)` に更新、`units.lessons_since_exam + 1`、`lessons` と `dialogue_turns` の削除 |
+| 発話の認識の成功 | 未応答の利用者の字幕 (`replied = false`) の削除と、新しい利用者の字幕の挿入。親の行を `for update` で取り、無ければ破棄 |
+| 応答の成功 | 親の行を `for update` で取り、無ければ破棄。残っていれば、`dialogue_turns` に利用者の字幕の `replied = true` と応答の字幕、`round_count + 1`、授業では `degrees` を要素ごとの `greatest` で更新 |
+| まとめの成功 | 親の行 (`lessons`) を `for update` で取り、無ければ破棄。残っていれば、`lesson_records` の挿入、`units.understanding` を `least(100, 前 + 得点 × 5)` に更新、`units.lessons_since_exam + 1`、`lessons` と `dialogue_turns` の削除 |
 | 模試の保存 | `mock_exams` の挿入、`units.lessons_since_exam = 0`。行をロックして (`select ... for update nowait`) 同時の挑戦を防ぐ |
 | 単元の学習記録の削除 | `lesson_records` と `mock_exams` の削除、`units.understanding = 0`、`units.lessons_since_exam = 0` |
 | 教材の削除 | `materials` の削除 (`material_images`、進行中の `lessons` と `consultations` は連鎖して消える) |
@@ -517,7 +531,7 @@ erDiagram
 | 要件 | 満たす仕組み |
 | --- | --- |
 | NFR-101 待ち時間を感じさせないリアクション | ① 「話し終える」を押した瞬間に、フロントエンドが頷く仕草を出す。② 発話の API (STT だけ) と、応答の API (LLM) を分け、認識の結果が返った直後に、相槌と字幕「あなた」を出す。③ 生徒の応答と学習評価の 2 つの LLM を並行して呼ぶ (`CompletableFuture`)。④ 応答の JSON が届いたら、すぐに音声の取得を始め、ペンの待ちの 2 秒に音声の生成を重ねる。⑤ 学習評価の結果は、利用者には見せず、応答の表示を待たせるだけにする。応答の速さは、人が判断する (仕様書 3 節)。応答の速さに数値の目標は置かない |
-| NFR-201 時間と回数の上限 | 上限は、サーバーが強制する。① 開始時刻と期限は、サーバーが決める。クライアントの申告は信じない。② 発話の受け付けは、`round_count < 上限` かつ `now < deadline_at` のときだけ。満たさなければ録音を捨てて 409。③ 往復は、応答の成功と同じトランザクションで数える。④ 1 つの授業と相談に、処理中の印 (`busy_since`) を置き、同時に 1 つの処理だけを通す。⑤ 1 回の発話の LLM の呼び出しは、2 回に固定する。自動の再試行は、教材の整理の 1 回だけ。⑥ 録音は 60 秒と 5 MB まで。⑦ 応答 1 つの音声は、1 回だけ生成する。⑧ 外部呼び出しには、タイムアウトを付ける (4.3)。⑨ 往復に数えない失敗 (認識の空、応答の失敗) が続いても、10 分の期限で止まる。⑩ クライアントの時計とのずれは、`serverNow` で補正し、まとめには 3 秒の猶予を持たせる。フロントエンドは、同じ上限でチャイムを出す (5.2)。`GET /test/ai-calls` で、呼び出しの数が上限を超えないことを、受け入れテストが確かめる |
+| NFR-201 時間と回数の上限 | 上限は、サーバーが強制する。① 開始時刻と期限は、サーバーが決める。クライアントの申告は信じない。② 発話の受け付けは、`round_count < 上限` かつ `now < deadline_at` のときだけ。満たさなければ録音を捨てて 409。③ 応答の受け付けは、未応答の発話が最後の 1 件であることに加え、同じ 2 つの条件を、受け付けの時点で確かめる。受け付けた 1 往復だけ、期限をまたいで完了させる。④ 未応答の発話は、授業か相談ごとに 1 件まで (新しい発話で置き換える)。応答が失敗しても、往復に数えないまま未応答が積み上がらない。⑤ 往復は、応答の成功と同じトランザクションで数える。⑥ 1 つの授業と相談に、処理中の印 (`busy_since`) を置き、同時に 1 つの処理だけを通す。⑦ 1 回の発話の LLM の呼び出しは、2 回に固定する。自動の再試行は、教材の整理の 1 回だけ。⑧ 録音は 60 秒と 5 MB まで。⑨ 応答 1 つの音声は、1 回だけ生成する。⑩ 外部呼び出しには、タイムアウトを付ける (4.3)。⑪ 往復に数えない失敗 (認識の空、応答の失敗) が続いても、受け付けは期限の前だけのため、10 分で止まる。⑫ 中断の後に完了した LLM の結果は、記録も保存もしない (4.4 の排他)。⑬ クライアントの時計とのずれは、`serverNow` で補正し、まとめには 3 秒の猶予を持たせる。フロントエンドは、同じ上限でチャイムを出す (5.2)。`GET /test/ai-calls` で、呼び出しの数が上限を超えないことを、受け入れテストが確かめる |
 | NFR-301 外部 AI サービスへの送信 | ① 送る内容は、`ai` ポートの入力の型で、処理に必要なものだけに限る。氏名、学校名、連絡先を持つ項目は、DB にも、API にも、ポートの型にも置かない。② 授業と相談の API は、設定の `privacy_confirmed` が無い利用者に 409 `privacy_not_confirmed` を返す (音声、字幕、ボードの画像を送らない)。③ 教材の登録と宿題の丸つけは、`photoConfirmed` が true でなければ 400 `photo_not_confirmed` を返し、画像を保存も送信もしない。フロントエンドも、チェックが無ければボタンを押せなくする。④ 利用者の発話、画像の中身の個人情報は、検出も除去もしない (仕様書 2.2)。授業と相談の画面と、初期セットアップに、注意を出す。⑤ ログに、発話、字幕、ボード、画像の中身を出さない。⑥ 通信は、Cloud Run の HTTPS。秘密情報は、環境変数 (Secret Manager から注入) で持ち、リポジトリにも画面にも出さない |
 | NFR-302 保存するデータ | 7 節のとおり、教材 (画像と整理の結果)、まとめノート、模試の結果、理解度を、利用者の識別子に結びつけて PostgreSQL に保存する。録音は保存しない。字幕とボードの画像は、7.4 のとおり、記録の後に残さない。同じブラウザで開き直せば、Cookie の有効期間 (400 日) のあいだ、同じ記録が見える |
 | NFR-303 削除 | `DELETE /materials/{id}` と `DELETE /records/units/{id}` を、それぞれ 1 つのトランザクションで行い、何度呼んでも 204 を返す (二重の押下に耐える)。フロントエンドは、確認のダイアログを 1 つだけ出し、実行中はボタンを無効にする |
@@ -546,10 +560,12 @@ erDiagram
 | 期限に達したとき `holding` の応答を、音声なしですぐに出してチャイムを鳴らす | 仕様書 5.5 は「書き込みが続く間はいつまでも待つ」と「書き込み中でもチャイムは表示する」を定めるが、両者が衝突したときの順序は定めていない (概念モデル 6 節の未確定点)。応答は、すでに費用をかけて作り、往復も数えているため、捨てずに出す。チャイムで授業を止められるため、進行不能にならない | 保留の応答を捨てる: 数えた往復と食い違う。チャイムを、書き込みが終わるまで遅らせる: 時間の上限が守れず、進行も止まる |
 | 最初の発話の LLM が失敗したら、固定の文言を出す | 仕様書は、最初の発話の失敗を定めていない。授業を始められないのは、進行不能であり、致命的な異常系になる | 授業の開始を失敗にする: 利用者が先へ進めない。再試行する: 費用の暴走の可能性 |
 | 引用する板書を、文章 (式は文字) の配列にする | 仕様書は、引用する板書の形を定めていない。ボードの画像を切り出して保存すると、位置の特定と画像の保存が必要になり、MVP の費用に合わない。文章なら、まとめノートも画像書き出しも、画面の DOM だけで済む | 画像の切り抜き: 範囲の特定が難しく、保存先も増える |
-| 問題文の図表を、Markdown の表と文章の説明にする | 仕様書は、図表の形を定めていない。清書を LLM が行うため、画像を再生成せず、文字で表す | 図の画像を生成して保存する: MVP の費用に合わない |
+| 問題文の図表を、教材の画像の矩形 (`Figure`) で持ち、表示のたびに端末で切り出す | 仕様書 5.3 と 5.5 は、清書した問題文と図表を「ボードに置く」ことを求める。図形、グラフ、回路図は、文字に置き換えると形が伝わらない。矩形なら、LLM は位置を答えるだけで、画像の生成も保存も要らず、費用が増えない。切り出しは端末の canvas で行うため、サーバーに画像の加工の部品が要らない | 図表を Markdown の表と文章の説明にする: 図形や回路図が伝わらず、仕様書 5.5 の「図表を置く」を満たさない。図の画像を LLM に生成させて保存する: 費用が増え、MVP の費用に合わない。サーバーで切り出して保存する: 切り出し済みの画像の保存先と、切り出しの部品が増える |
 | 模試の材料は、直近の授業の教材の問題とポイントとする。その教材が削除されていれば、教科、単元名、種類、得点だけで作る | 概念モデル 6 節の未確定点 (教材を削除した後の模試の材料) への対処。整理の結果の複製を持たない (概念モデルの方針) ため、材料が無いときの代替を決める | 模試の機会を消す: 利用者が挑戦できなくなる。整理の結果を複製して保存する: 概念モデルの方針に反する |
 | 模試の材料の、複数の教材がある単元では、直近の記録の授業の教材のポイント 3 件を使う | 仕様書 5.7 は「その単元の指導のポイント 3 件」とするが、教材ごとに 3 件があり、どの 3 件かが定まらない (概念モデル 6 節)。「直近の授業で使った問題」と同じ問題の 3 件に合わせる | 単元共通のポイントを作る: 概念モデルの方針に反する |
 | 状態機械を、授業と相談で別々の reducer にする | 授業には学習評価、チャイムの後のまとめ、最初の発話があり、相談には無い。共通化すると条件分岐が増える。同じ部品 (`shared/board`、`shared/audio`) を使い、重複は小さい | 1 つの汎用の状態機械: 条件分岐が増え、納期に合わない |
+| 未応答の利用者の字幕を 1 件までにし、新しい発話で置き換える | 発話の API (STT) は処理中の印を STT の後で外すため、未応答の発話を何件も作ると、応答の API を順に呼んで、上限と期限を超えた LLM の呼び出しができてしまう (NFR-201)。1 件に絞れば、応答の回数は、受け付けの検査 (往復と期限) で止まる。応答が失敗したあとの「もう一度話す」は、古い字幕を置き換えれば済む | 発話の時点で未応答を拒む: 応答が失敗したあとに、利用者が話し直せなくなる (進行不能)。応答の API を呼ぶ前の検査を、クライアントに任せる: 費用の上限を守れない |
+| 中断と記録の確定を、授業の行の `for update` で排他する | 中断 (削除) と、まとめの確定 (記録の挿入) が同時に起きると、削除済みの授業の記録が残る。授業の行を両方で取れば、どちらか一方が先になり、後の側は結果を捨てられる。仕様書 5.6 の「成功する前に画面を離れた授業は、記録しない」を、この排他で守る | 中断の時にフラグだけ立てる: 記録の挿入の側がフラグを見落とす余地が残る。記録の後に授業を消すことだけで守る: 削除の前に記録が挿入されると、記録が残る。行のロックは、単一の PostgreSQL で足り、MVP の規模に合う |
 
 ## 10. 範囲の判断
 

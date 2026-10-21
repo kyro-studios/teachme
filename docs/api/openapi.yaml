@@ -345,6 +345,32 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /materials/{materialId}/images/{position}:
+    parameters:
+      - $ref: '#/components/parameters/MaterialId'
+      - $ref: '#/components/parameters/ImagePosition'
+    get:
+      tags: [materials]
+      operationId: getMaterialImage
+      summary: 教材の画像を、登録したときのまま返す (図表の切り出しに使う)
+      description: |
+        画面は、`Figure.region` の矩形を、この画像から切り出してボードや教材の詳細に表示する。
+        画像は、登録したときのバイト列のまま返す。ほかの利用者の教材、または存在しない番号は 404 を返す。
+      responses:
+        '200':
+          description: 教材の画像 (JPEG か PNG。`Content-Type` で区別する)
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /consultations:
     post:
       tags: [consultations]
@@ -410,7 +436,11 @@ paths:
       summary: 認識できた発話に対する、先輩先生の応答を作る (LLM を 1 回呼ぶ)
       description: |
         応答の材料は、問題、模範解答、解説、指導のポイント、発話、これまでの字幕、ボードの画像、指している範囲。
-        成功すると、応答の字幕と相談の往復を 1 つ増やす。失敗したときは、往復を増やさない。
+        - 受け付けるのは、`utteranceId` が未応答の最後の発話のときだけ。応答済みなら 409 `already_replied`、新しい発話で置き換えられていれば 409 `utterance_not_found`。
+        - 受け付けの時点で、往復が 15 未満で、期限に達していないことを確かめる。満たさなければ 409 `limit_reached`。
+        - 受け付けた 1 往復は、期限をまたいでも完了させる。
+        - 成功すると、相談の行を確かめたうえで、応答の字幕を保持し、往復を 1 つ増やす。相談の行が無ければ (中断された後なら) 結果を捨てて 404 を返す。
+        - 失敗したときは、往復を増やさない。利用者の字幕は残す。
       requestBody:
         $ref: '#/components/requestBodies/ReplyMaterials'
       responses:
@@ -510,7 +540,9 @@ paths:
         利用者が「話し終える」を押した直後に呼ぶ。認識の結果が返った時点で、クライアントが相槌を表示する (NFR-101)。
         認識結果が空のとき、または STT が失敗したときは、200 で `recognized` を false にして返す。往復には数えない。
         認識できたときは、利用者の字幕を、授業の字幕として保持し、`utteranceId` を返す。
+        未応答の利用者の字幕 (`replied` が false) が残っていれば、それを消して置き換える。未応答の発話は、授業ごとに 1 件だけ。
         授業の上限 (往復 20 回、または期限) に達しているときは、録音を捨てて 409 `limit_reached` を返す。
+        STT の返答の時点で授業が無いとき (中断された後) は、結果を捨てて 404 を返す。
         録音データは、認識が終われば残さない。
       requestBody:
         $ref: '#/components/requestBodies/UtteranceAudio'
@@ -536,9 +568,11 @@ paths:
         - 生徒の応答の材料は、問題文、ボードの画像、発話、これまでの字幕、指している範囲。模範解答、解説、指導のポイントは渡さない。
         - 学習評価の材料は、指導のポイント 3 件、模範解答、解説、問題文、ボードの画像、発話、これまでの字幕、指している範囲。結果は返さない。
         - 両方が終わってから返す。学習評価だけが失敗したときは、応答を返し、その発話の度合いは変えない。
-        - 成功すると、応答の字幕を保持し、往復を 1 つ増やし、度合いを「それまでの最大値」で更新する。
+        - 受け付けるのは、`utteranceId` が未応答の最後の発話のときだけ。応答済みなら 409 `already_replied`、新しい発話で置き換えられていれば 409 `utterance_not_found`。
+        - 受け付けの時点で、往復が 20 未満で、期限に達していないことを確かめる。満たさなければ 409 `limit_reached`。
+        - 受け付けた 1 往復は、期限をまたいでも完了させる (応答の途中で期限に達しても、その 1 往復は終える)。
+        - 成功すると、授業の行を確かめたうえで、応答の字幕を保持し、往復を 1 つ増やし、度合いを「それまでの最大値」で更新する。授業の行が無ければ (中断された後なら) 結果を捨てて 404 を返す。
         - 生徒の応答が失敗したときは、502 を返す。往復も度合いも変えない。利用者の字幕は残す。
-        - すでに応答済みの `utteranceId` は 409 `already_replied`。
       requestBody:
         $ref: '#/components/requestBodies/ReplyMaterials'
       responses:
@@ -587,10 +621,15 @@ paths:
       operationId: createLessonSummary
       summary: チャイムの後に、まとめノートを作り、授業を記録する (仕様書 5.6)
       description: |
+        - 授業が無いとき (中断された後、またはほかの利用者のもの) は、404 を返す。LLM は呼ばない。
+        - 同じ授業の記録が既にあれば、LLM を呼ばず、保存済みの結果を 200 で返す。
         - 授業の上限 (往復 20 回、または期限) に達していないときは、409 `limit_not_reached`。
+        - 処理中 (`busy`) のときは、409 `busy`。
         - LLM を 1 回呼び、まとめ文と引用する板書を作る。材料は、この授業の字幕と、リクエストのボードの画像。
-        - 成功したときは、1 つのトランザクションで、授業の記録とまとめノートの保存、理解度の更新 (`min(100, 前の値 + 授業の得点 × 5)`)、
-          模試の機会の数えの更新、字幕の削除を行う。同じ授業に対する 2 回目以降の呼び出しは、LLM を呼ばず、保存済みの結果を返す。
+        - 成功したときは、1 つのトランザクションで行う。まず授業の行を `for update` で取り、
+          行が無ければ (LLM の呼び出しの間に中断された)、結果を捨てて 404 を返し、何も記録しない。
+          行があれば、授業の記録とまとめノートの保存、理解度の更新 (`min(100, 前の値 + 授業の得点 × 5)`)、模試の機会の数えの更新、字幕と授業の行の削除を行う。
+        - 同時に 2 回呼ばれたときは、先に確定した呼び出しの結果を、後の呼び出しが返す (後の呼び出しは、授業の行が無く、記録が有るため)。
         - 失敗したときは、502 を返す。何も記録しない。クライアントは、ボードの画像を持ち続け、「やり直す」で同じ呼び出しをもう一度行う。
       requestBody:
         required: true
@@ -638,7 +677,8 @@ paths:
       summary: 授業を中断する。記録せず、字幕を消す
       description: |
         画面を離れるときに、クライアントが `fetch` の `keepalive` で呼ぶ。すでに無い授業でも 204 を返す。
-        記録済みの授業には何もしない。
+        記録済みの授業には何もしない。処理中 (まとめ、応答、発話の認識) でも消す。
+        処理が後から終わっても、授業の行が無いため、その結果は記録も保存もされない (`createLessonSummary`、`replyLesson`、`sendLessonUtterance` を参照)。
       responses:
         '204':
           description: 中断した (または、すでに無かった)
@@ -905,6 +945,15 @@ components:
       schema:
         type: string
         format: uuid
+    ImagePosition:
+      name: position
+      in: path
+      required: true
+      description: 教材の画像の番号 (1 から 3)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3
     ConsultationId:
       name: consultationId
       in: path
@@ -1022,7 +1071,7 @@ components:
         `limit_reached` (往復の上限、または時間の上限に達している)、
         `busy` (同じ授業または相談で、別の処理が進行中)、
         `already_replied` (その発話には応答済み)、
-        `utterance_not_found` (認識できた発話が無い)。
+        `utterance_not_found` (未応答の最後の発話ではない。新しい発話で置き換えられた、または無い)。
       content:
         application/json:
           schema:
@@ -1226,11 +1275,17 @@ components:
 
     Problem:
       type: object
-      required: [problemText, modelAnswer, explanationSteps, studentWork, teachingPoints]
+      required: [problemText, figures, modelAnswer, explanationSteps, studentWork, teachingPoints]
       properties:
         problemText:
           type: string
-          description: 清書した問題文。図表は、Markdown の表や、文章の説明として含める
+          description: 清書した問題文。図表は含めず、`figures` で別に持つ (図表を文字に置き換えない)
+        figures:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/Figure'
+          description: 問題の図表 (図形、グラフ、回路図など)。教材の画像の中の位置。無ければ空の配列。表示は、問題文の下に、この順で並べる
         modelAnswer:
           type: string
         explanationSteps:
@@ -1250,13 +1305,29 @@ components:
 
     Region:
       type: object
-      description: ボード全体の画像に対する、0 以上 1 以下の割合で表した矩形。左上が原点
+      description: 対象の画像全体 (ボードの画像、または教材の画像) に対する、0 以上 1 以下の割合で表した矩形。左上が原点
       required: [x, y, width, height]
       properties:
         x: { type: number, minimum: 0, maximum: 1 }
         y: { type: number, minimum: 0, maximum: 1 }
         width: { type: number, minimum: 0, maximum: 1 }
         height: { type: number, minimum: 0, maximum: 1 }
+
+    Figure:
+      type: object
+      description: |
+        問題の図表。教材の画像の 1 枚の中の、矩形の部分。LLM が、図表の位置を矩形で答え、サーバーが形を検査する。
+        画面は、`GET /materials/{materialId}/images/{position}` で画像を取り、`region` を切り出して表示する。
+        矩形の決まり: `x + width` と `y + height` は 1 以下、`width` と `height` は 0 より大きい。外れるときは、整理を失敗とみなす。
+      required: [imagePosition, region]
+      properties:
+        imagePosition:
+          type: integer
+          minimum: 1
+          maximum: 3
+          description: 教材の画像の番号 (1 から、教材の画像の枚数まで)
+        region:
+          $ref: '#/components/schemas/Region'
 
     Turn:
       type: object
@@ -1288,7 +1359,7 @@ components:
 
     LessonStart:
       type: object
-      required: [lessonId, startedAt, serverNow, deadlineAt, maxRounds, student, problemText, studentWork, opening]
+      required: [lessonId, startedAt, serverNow, deadlineAt, maxRounds, student, problemText, figures, studentWork, opening]
       properties:
         lessonId:
           type: string
@@ -1311,6 +1382,11 @@ components:
           $ref: '#/components/schemas/StudentType'
         problemText:
           type: string
+        figures:
+          type: array
+          items:
+            $ref: '#/components/schemas/Figure'
+          description: 問題文の下に置く図表 (`Problem.figures` と同じ)
         studentWork:
           type: string
         opening:
@@ -1370,7 +1446,7 @@ components:
 
     ConsultationStart:
       type: object
-      required: [consultationId, startedAt, serverNow, deadlineAt, maxRounds, problemText]
+      required: [consultationId, startedAt, serverNow, deadlineAt, maxRounds, problemText, figures]
       properties:
         consultationId:
           type: string
@@ -1389,6 +1465,11 @@ components:
           enum: [15]
         problemText:
           type: string
+        figures:
+          type: array
+          items:
+            $ref: '#/components/schemas/Figure'
+          description: 問題文の下に置く図表 (`Problem.figures` と同じ)
 
     ConsultationReply:
       type: object
@@ -1579,7 +1660,7 @@ components:
                 type: object
                 description: |
                   `success` のときの中身。`kind` ごとの形は次のとおり。省略したときは、既定の成功の応答を使う。
-                  - `organize`: `Problem` と同じ形
+                  - `organize`: `Problem` と同じ形 (`figures` を含む。図表が無いときは空の配列)
                   - `student_reply`: `{ text, expression, annotation }` (`annotation` は `StudentAnnotation` か null)
                   - `evaluation`: `{ degrees: [0 から 2 の整数を 3 つ] }`
                   - `mentor_reply`: `{ text, boardWrites }` (`BoardWrite` の配列)
@@ -1591,7 +1672,7 @@ components:
                 additionalProperties: true
       x-defaults: |
         既定の成功の応答 (何も決めていないとき):
-        - `organize`: 問題「y = x^2 - 4x + 3 の頂点を求めなさい」、模範解答「頂点は (2, -1)」、解説の 1 ステップ「平方完成して頂点を読む」、
+        - `organize`: 問題「y = x^2 - 4x + 3 の頂点を求めなさい」、図表は無し (`figures: []`)、模範解答「頂点は (2, -1)」、解説の 1 ステップ「平方完成して頂点を読む」、
           生徒の途中の解答「y = (x - 2)^2 と書いて手が止まっている」、指導のポイント 3 件
         - `student_reply`: `{ text: "なぜそうなるのですか？", expression: "troubled", annotation: null }`
         - `evaluation`: `{ degrees: [1, 1, 1] }`
