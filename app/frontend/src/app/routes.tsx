@@ -34,6 +34,8 @@ async function gateLoader({ request }: LoaderFunctionArgs) {
 export const routes: RouteObject[] = [
   {
     loader: gateLoader,
+    // 親は pathless で、子を移っても再実行されないため、どの遷移でも判定を通す
+    shouldRevalidate: () => true,
     children: [
       // 「/」は gateLoader が、設定の有無に応じて /setup か /home へ寄せる
       { index: true },
