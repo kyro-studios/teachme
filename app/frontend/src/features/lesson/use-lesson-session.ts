@@ -2,13 +2,14 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useReducer, useRef, type RefObject } from "react";
 import { ApiError } from "../../api/client";
-import { configQuery } from "../../api/queries";
+import { configQuery, homeQuery } from "../../api/queries";
 import { playChime } from "../../shared/audio/chime";
 import { playAudio, type Playback } from "../../shared/audio/player";
 import { RecordingError, startRecording, type Recording } from "../../shared/audio/recorder";
 import type { BoardHandle, Region } from "../../shared/board";
 import {
   abandonLesson,
+  createLessonSummary,
   forgetLessonEntry,
   loadLessonAudio,
   replyToUtterance,
@@ -46,6 +47,8 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
   const placedRef = useRef<LessonState["shown"]>(null);
   const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const audioRef = useRef<{ turnId: string; src: Promise<string> } | null>(null);
+  // チャイムの時点のボードの画像。まとめの作成に送り、「やり直す」でも同じものを使う
+  const summaryImageRef = useRef<Blob | null>(null);
 
   // 期限。達したら、状態ごとの扱いは reducer が決める
   useEffect(() => {
@@ -244,6 +247,63 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
     }
   }, [state.seq, boardRef]);
 
+  // チャイムの時点で、ボードの画像を取り、まとめを始める。取れなかったときは、まとめの失敗として、やり直せる
+  useEffect(() => {
+    if (state.phase !== "chime") {
+      return;
+    }
+    let active = true;
+    void captureBoard(boardRef).then(
+      (image) => {
+        if (active) {
+          summaryImageRef.current = image;
+          dispatch({ type: "summarize" });
+        }
+      },
+      () => {
+        if (active) {
+          dispatch({ type: "summaryFailed" });
+        }
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [state.seq, boardRef]);
+
+  // まとめの作成 (LLM)。成功したら、まとめノートを出し、ホームの「今週の授業」を取り直す
+  useEffect(() => {
+    if (state.phase !== "summarizing") {
+      return;
+    }
+    let active = true;
+    const image = summaryImageRef.current;
+    void (image ? Promise.resolve(image) : captureBoard(boardRef))
+      .then((boardImage) => {
+        summaryImageRef.current = boardImage;
+        return createLessonSummary(entry.lessonId, boardImage);
+      })
+      .then(
+        (summary) => {
+          if (active) {
+            dispatch({
+              type: "summarized",
+              summary: { summaryText: summary.summaryText, quotes: summary.quotes },
+            });
+            void queryClient.invalidateQueries({ queryKey: homeQuery.queryKey });
+          }
+        },
+        () => {
+          if (active) {
+            dispatch({ type: "summaryFailed" });
+          }
+        },
+      );
+    return () => {
+      active = false;
+    };
+  }, [state.seq, entry.lessonId, boardRef, queryClient]);
+
   // 画面を離れると、授業を中断する。開発時の二重の実行では、直前の中断を取り消す
   useEffect(() => {
     clearTimeout(leaveTimerRef.current);
@@ -271,7 +331,23 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
     }
   };
 
-  return { state, pressTalk };
+  /** 「やり直す」。まとめの作成をもう一度行う */
+  const pressRetrySummary = () => {
+    if (state.phase === "summaryFailed") {
+      dispatch({ type: "retrySummary" });
+    }
+  };
+
+  return { state, pressTalk, pressRetrySummary };
+}
+
+/** チャイムの時点のボードの画像 (PNG) を取る。ボードが無いときは例外にする */
+async function captureBoard(boardRef: RefObject<BoardHandle | null>): Promise<Blob> {
+  const board = boardRef.current;
+  if (!board) {
+    throw new Error("ボードの準備ができていません");
+  }
+  return board.exportPng();
 }
 
 /** 音声が URL の作成 (blob:) だったときは、取り消す。外部の URL には何もしない */

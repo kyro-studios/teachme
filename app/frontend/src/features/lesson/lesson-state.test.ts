@@ -9,9 +9,11 @@ import {
   REPLY_FAILED_MESSAGE,
   replySpeech,
   openingSpeech,
+  SUMMARY_FAILED_MESSAGE,
   type LessonEvent,
   type LessonState,
   type Speech,
+  type SummaryNote,
 } from "./lesson-state";
 
 const OPENING: Speech = {
@@ -320,5 +322,83 @@ describe("相槌", () => {
       annotation: null,
       limitReached: false,
     });
+  });
+});
+
+describe("まとめ", () => {
+  const SUMMARY: SummaryNote = { summaryText: "今日は頂点の求め方を教わりました。", quotes: [] };
+
+  /** チャイムの後の状態 (期限に達して、発話待ちからチャイムへ進んだ) */
+  function chime(): LessonState {
+    return run(idle(), { type: "timeUp" });
+  }
+
+  test("チャイムの後、まとめの作成を始める。チャイムの文言は残す", () => {
+    const state = run(chime(), { type: "summarize" });
+
+    expect(state.phase).toBe("summarizing");
+    expect(state.notice).toBe(CHIME_MESSAGE);
+  });
+
+  test("まとめの作成が成功すると、まとめノートを持つ状態になる", () => {
+    const state = run(chime(), { type: "summarize" }, { type: "summarized", summary: SUMMARY });
+
+    expect(state.phase).toBe("summarized");
+    expect(state.phase === "summarized" && state.summary).toEqual(SUMMARY);
+    expect(state.notice).toBe(CHIME_MESSAGE);
+  });
+
+  test("まとめの作成が失敗すると、失敗の文言を出し、「やり直す」を待つ", () => {
+    const state = run(chime(), { type: "summarize" }, { type: "summaryFailed" });
+
+    expect(state.phase).toBe("summaryFailed");
+    expect(state.notice).toBe(SUMMARY_FAILED_MESSAGE);
+  });
+
+  test("ボードの画像を取れなかったときも、まとめの失敗として「やり直す」を出す", () => {
+    const state = run(chime(), { type: "summaryFailed" });
+
+    expect(state.phase).toBe("summaryFailed");
+    expect(state.notice).toBe(SUMMARY_FAILED_MESSAGE);
+  });
+
+  test("「やり直す」を押すと、まとめの作成をもう一度始め、失敗の文言は消える", () => {
+    const failed = run(chime(), { type: "summarize" }, { type: "summaryFailed" });
+
+    const state = run(failed, { type: "retrySummary" });
+
+    expect(state.phase).toBe("summarizing");
+    expect(state.notice).toBe(CHIME_MESSAGE);
+  });
+
+  test("「やり直す」は、まとめが失敗しているときだけ受け付ける", () => {
+    const summarizing = run(chime(), { type: "summarize" });
+    const summarized = run(summarizing, { type: "summarized", summary: SUMMARY });
+
+    expect(lessonReducer(summarizing, { type: "retrySummary" })).toBe(summarizing);
+    expect(lessonReducer(summarized, { type: "retrySummary" })).toBe(summarized);
+  });
+
+  test("まとめの開始は、チャイムの後だけ受け付ける", () => {
+    const idleState = idle();
+
+    expect(lessonReducer(idleState, { type: "summarize" })).toBe(idleState);
+  });
+
+  test("まとめの結果と失敗は、まとめの作成中だけ受け付ける", () => {
+    const current = chime();
+
+    expect(lessonReducer(current, { type: "summarized", summary: SUMMARY })).toBe(current);
+    expect(lessonReducer(current, { type: "summaryFailed" })).not.toBe(current);
+    const failed = run(current, { type: "summaryFailed" });
+    expect(lessonReducer(failed, { type: "summarized", summary: SUMMARY })).toBe(failed);
+  });
+
+  test("まとめの作成の途中や後に期限に達しても、状態は変わらない", () => {
+    const summarizing = run(chime(), { type: "summarize" });
+    const summarized = run(summarizing, { type: "summarized", summary: SUMMARY });
+
+    expect(lessonReducer(summarizing, { type: "timeUp" })).toBe(summarizing);
+    expect(lessonReducer(summarized, { type: "timeUp" })).toBe(summarized);
   });
 });
