@@ -112,7 +112,22 @@ public final class OrganizedProblem {
   public record Figure(int imagePosition, Region region) {}
 
   /** 対象の画像全体に対する、0 以上 1 以下の割合で表した矩形。左上が原点。 */
-  public record Region(double x, double y, double width, double height) {}
+  public record Region(double x, double y, double width, double height) {
+
+    /** 0 以上 1 以下の範囲に収まり、幅と高さは 0 より大きい。NaN と無限大は外れとする。 */
+    public boolean fitsInImage() {
+      return Double.isFinite(x)
+          && Double.isFinite(y)
+          && Double.isFinite(width)
+          && Double.isFinite(height)
+          && x >= 0
+          && y >= 0
+          && width > 0
+          && height > 0
+          && x + width <= 1
+          && y + height <= 1;
+    }
+  }
 
   private static boolean containsNull(List<String> items) {
     return items.stream().anyMatch(item -> item == null);
@@ -123,20 +138,6 @@ public final class OrganizedProblem {
         && figure.region() != null
         && figure.imagePosition() >= 1
         && figure.imagePosition() <= imageCount
-        && isValidRegion(figure.region());
-  }
-
-  /** 0 以上 1 以下の範囲に収まり、幅と高さは 0 より大きい。NaN と無限大は外れとする。 */
-  private static boolean isValidRegion(Region region) {
-    return Double.isFinite(region.x())
-        && Double.isFinite(region.y())
-        && Double.isFinite(region.width())
-        && Double.isFinite(region.height())
-        && region.x() >= 0
-        && region.y() >= 0
-        && region.width() > 0
-        && region.height() > 0
-        && region.x() + region.width() <= 1
-        && region.y() + region.height() <= 1;
+        && figure.region().fitsInImage();
   }
 }

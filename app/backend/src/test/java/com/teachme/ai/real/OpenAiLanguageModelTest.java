@@ -192,6 +192,32 @@ class OpenAiLanguageModelTest {
   }
 
   @Test
+  void 生徒の応答は_ボードの画像が無くても_問題文と途中の解答だけで作る() {
+    stub.enqueueContent(STUDENT_JSON);
+    StudentReplyInput opening =
+        new StudentReplyInput(
+            StudentType.LOGICAL,
+            "y = x^2 - 4x + 3 の頂点を求めなさい",
+            "y = (x - 2)^2 と書いて手が止まっている",
+            null,
+            null,
+            List.of(),
+            List.of());
+
+    LanguageModel.StudentReply reply =
+        model().studentReply(context(AiCallKind.STUDENT_REPLY), opening);
+
+    assertEquals("なぜそうなるのですか？", reply.text());
+    Recorded request = stub.requests().get(0);
+    assertEquals("dialogue-model", request.body().get("model").asText());
+    JsonNode content = userContent(request);
+    assertEquals(1, content.size());
+    assertEquals("text", content.get(0).get("type").asText());
+    assertTrue(content.get(0).get("text").asText().contains("y = (x - 2)^2 と書いて手が止まっている"));
+    assertLogged("student_reply", "dialogue-model", "success", "");
+  }
+
+  @Test
   void 生徒の応答は_印が無いとき_annotation_を_null_にする() {
     stub.enqueueContent("{\"text\":\"なるほど！\",\"expression\":\"convinced\",\"annotation\":null}");
 
