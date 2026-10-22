@@ -11,15 +11,9 @@ export function HomeMenu() {
     return null;
   }
 
-  const { todayMode, hasOrganizedMaterial, mockExamAvailable } = home.data;
+  const { todayMode, hasOrganizedMaterial } = home.data;
   return (
     <section className="grid gap-4">
-      {mockExamAvailable ? (
-        <div>
-          <Button>模試に挑戦</Button>
-        </div>
-      ) : null}
-
       {todayMode === "normal" ? (
         <div className="grid justify-items-start gap-3">
           <Button onClick={() => navigate("/lessons/new")}>授業を始める</Button>

@@ -13,6 +13,9 @@ export type StudentTypesResponse =
 
 export type Home = components["schemas"]["Home"];
 
+/** 模試の結果 (`GET /mock-exams/{id}`、`POST /mock-exams` の応答)。`history` は同じ単元の偏差値の推移 */
+export type MockExamResult = components["schemas"]["MockExamResult"];
+
 export const configQuery = queryOptions({
   queryKey: ["config"],
   queryFn: () => apiFetch<Config>("/config"),
@@ -32,3 +35,11 @@ export const homeQuery = queryOptions({
   queryKey: ["home"],
   queryFn: () => apiFetch<Home>("/home"),
 });
+
+/** 模試の結果 (`GET /mock-exams/{id}`)。挑戦の直後は、その結果を置いておき、結果の画面をすぐ表示する */
+export function mockExamQuery(mockExamId: string) {
+  return queryOptions({
+    queryKey: ["mock-exam", mockExamId],
+    queryFn: () => apiFetch<MockExamResult>(`/mock-exams/${mockExamId}`),
+  });
+}
