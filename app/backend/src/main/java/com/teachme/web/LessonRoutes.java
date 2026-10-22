@@ -1,21 +1,14 @@
 package com.teachme.web;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.teachme.application.DialogueService.Recognition;
 import com.teachme.application.DialogueService.Recording;
 import com.teachme.application.DialogueSweeper;
 import com.teachme.application.LessonService;
 import com.teachme.domain.Annotation;
-import com.teachme.domain.ImageFormat;
 import com.teachme.domain.OrganizedProblem;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
-import io.javalin.http.UploadedFile;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UncheckedIOException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -24,22 +17,12 @@ import java.util.UUID;
 /**
  * 授業 (`/api/lessons`、openapi.yaml の lessons)。検査と変換だけを行い、進行は {@link LessonService} に任せる。
  *
- * <p>進行中の授業と相談の掃除は、サーバーの起動と停止に合わせて開始と終了する。
+ * <p>進行中の授業と相談の掃除は、サーバーの起動と停止に合わせて開始と終了する。録音、ボードの画像、指している範囲の検査は、相談と共通の {@link DialogueRequests}
+ * を使う。
  */
 public final class LessonRoutes implements Routes {
 
-  static final String INVALID_BOARD_IMAGE_CODE = "invalid_board_image";
-  static final String INVALID_BOARD_IMAGE_MESSAGE = "ボードの画像は PNG で、5 MB 以下にしてください";
-
-  private static final String BOARD_IMAGE_FIELD = "boardImage";
-  private static final String POINTED_REGIONS_FIELD = "pointedRegions";
   private static final String AUDIO_MIME_TYPE = "audio/mpeg";
-
-  /** ボードの画像の大きさの上限 (5 MB)。 */
-  private static final long MAX_BOARD_BYTES = 5L * 1024 * 1024;
-
-  /** 指している範囲の件数の上限 (openapi.yaml の `ReplyMaterials`)。 */
-  private static final int MAX_POINTED_REGIONS = 10;
 
   /** `POST /lessons` の本文。 */
   public record StartLessonRequest(String materialId) {}
@@ -178,8 +161,8 @@ public final class LessonRoutes implements Routes {
       ApiErrors.notFound(ctx);
       return;
     }
-    byte[] board = readBoardImage(ctx);
-    List<OrganizedProblem.Region> pointedRegions = readPointedRegions(ctx);
+    byte[] board = DialogueRequests.readBoardImage(ctx);
+    List<OrganizedProblem.Region> pointedRegions = DialogueRequests.readPointedRegions(ctx);
     LessonService.Reply reply =
         lessons.reply(userId, lessonId.get(), utteranceId.get(), board, pointedRegions);
     ctx.json(
@@ -209,7 +192,7 @@ public final class LessonRoutes implements Routes {
       ApiErrors.notFound(ctx);
       return;
     }
-    byte[] board = readBoardImage(ctx);
+    byte[] board = DialogueRequests.readBoardImage(ctx);
     LessonService.Summary summary = lessons.summarize(userId, lessonId.get(), board);
     ctx.json(LessonSummaryResponse.of(summary));
   }
@@ -232,68 +215,5 @@ public final class LessonRoutes implements Routes {
     } catch (IllegalArgumentException | NullPointerException e) {
       return Optional.empty();
     }
-  }
-
-  /**
-   * ボードの画像を読む。形式は PNG、大きさは 5 MB 以下。外れたら、中身を読まずに拒否する。
-   *
-   * @throws ApiException 画像が無い、PNG でない、空、または 5 MB を超える (`invalid_board_image`)
-   */
-  private static byte[] readBoardImage(Context ctx) {
-    UploadedFile file = ctx.uploadedFile(BOARD_IMAGE_FIELD);
-    if (file == null || file.size() > MAX_BOARD_BYTES) {
-      throw invalidBoardImage();
-    }
-    byte[] bytes = readAtMost(file, MAX_BOARD_BYTES);
-    if (bytes.length == 0 || bytes.length > MAX_BOARD_BYTES) {
-      throw invalidBoardImage();
-    }
-    if (ImageFormat.detect(bytes).filter(format -> format == ImageFormat.PNG).isEmpty()) {
-      throw invalidBoardImage();
-    }
-    return bytes;
-  }
-
-  /**
-   * 指している範囲 (JSON の文字列) を読む。無ければ空。件数と範囲を検査する。
-   *
-   * @throws ApiException 形式が不正、件数が 10 を超える、範囲が外れている (`invalid_request`)
-   */
-  private static List<OrganizedProblem.Region> readPointedRegions(Context ctx) {
-    String json = ctx.formParam(POINTED_REGIONS_FIELD);
-    if (json == null || json.isBlank()) {
-      return List.of();
-    }
-    List<OrganizedProblem.Region> regions;
-    try {
-      regions =
-          Json.mapper().readValue(json, new TypeReference<List<OrganizedProblem.Region>>() {});
-    } catch (JsonProcessingException e) {
-      // Jackson の例外の文言には本文の一部が入りうるため、使わない
-      throw invalidRequest();
-    }
-    if (regions == null
-        || regions.size() > MAX_POINTED_REGIONS
-        || regions.stream().anyMatch(region -> region == null || !region.fitsInImage())) {
-      throw invalidRequest();
-    }
-    return regions;
-  }
-
-  /** 上限より 1 バイト多く読み、超えたかどうかを判定できるようにする。 */
-  private static byte[] readAtMost(UploadedFile file, long maxBytes) {
-    try (InputStream content = file.content()) {
-      return content.readNBytes((int) maxBytes + 1);
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-  }
-
-  private static ApiException invalidBoardImage() {
-    return ApiException.badRequest(INVALID_BOARD_IMAGE_CODE, INVALID_BOARD_IMAGE_MESSAGE);
-  }
-
-  private static ApiException invalidRequest() {
-    return ApiException.badRequest("invalid_request", ApiErrors.INVALID_REQUEST_MESSAGE);
   }
 }
