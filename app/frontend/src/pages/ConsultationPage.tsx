@@ -6,6 +6,7 @@ import {
   type ConsultationEntry,
 } from "../features/consultation/consultation-api";
 import { useConsultationFigures } from "../features/consultation/use-consultation-figures";
+import { useConsultationLeave } from "../features/consultation/use-consultation-leave";
 
 // ボード (tldraw) を含むため、相談の画面は開いたときに読み込む。画面の入口の読み込みを軽くするため
 const ConsultationSession = lazy(() =>
@@ -22,6 +23,8 @@ export function ConsultationPage() {
     queryKey: consultationEntryKey(materialId),
     queryFn: skipToken,
   });
+  // 図表の取得中や読み込み中に離れても中断するため、ここで監視する
+  useConsultationLeave(entry.data);
 
   if (!entry.data) {
     return <Navigate to={`/materials/${materialId}`} replace />;

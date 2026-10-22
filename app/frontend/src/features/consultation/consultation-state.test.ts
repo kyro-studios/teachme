@@ -184,16 +184,29 @@ describe("期限", () => {
     expect(state.shown).toEqual({ boardWrites: REPLY.boardWrites });
   });
 
-  test("応答を作っている途中で期限に達したら、応答の字幕と音声が終わってから区切る", () => {
+  test("応答を作っている途中で期限に達したら、応答が来た時点で字幕だけ出して区切る", () => {
     const waiting = run(awaitingReply(), { type: "timeUp" });
     expect(waiting.phase).toBe("awaitingReply");
 
-    const replied = run(waiting, { type: "replied", speech: REPLY }, { type: "penReady" });
-    expect(replied.phase).toBe("speaking");
+    const replied = run(waiting, { type: "replied", speech: REPLY });
+    expect(replied.phase).toBe("ended");
+    expect(replied.notice).toBe(ENDED_MESSAGE);
+    expect(replied.subtitles.at(-1)).toEqual({ speaker: "mentor", text: REPLY.text });
+    expect(replied.shown).toEqual({ boardWrites: REPLY.boardWrites });
+  });
 
-    const ended = run(replied, { type: "speechEnded" });
+  test("期限の後に応答が来ても、ペンが離れるのを待たず、ペンの書き込みが続いても区切りが止まらない", () => {
+    const ended = run(
+      awaitingReply(),
+      { type: "timeUp" },
+      { type: "replied", speech: REPLY },
+      { type: "penReady" },
+      { type: "speechEnded" },
+    );
+
     expect(ended.phase).toBe("ended");
-    expect(ended.subtitles.at(-1)).toEqual({ speaker: "mentor", text: REPLY.text });
+    expect(ended.notice).toBe(ENDED_MESSAGE);
+    expect(ended.subtitles.filter((subtitle) => subtitle.speaker === "mentor")).toHaveLength(1);
   });
 
   test("先輩先生が話している途中で期限に達したら、字幕と音声が終わってから区切る", () => {

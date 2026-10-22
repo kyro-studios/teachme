@@ -1,5 +1,5 @@
 // 相談の進行の副作用。状態機械 (consultation-state) の状態を見て、録音、API、音声、ボード、時計を動かし、結果を事象として返す
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useReducer, useRef, type RefObject } from "react";
 import { ApiError } from "../../api/client";
 import { configQuery } from "../../api/queries";
@@ -7,8 +7,6 @@ import { playAudio, type Playback } from "../../shared/audio/player";
 import { RecordingError, startRecording, type Recording } from "../../shared/audio/recorder";
 import type { BoardHandle, Region } from "../../shared/board";
 import {
-  abandonConsultation,
-  forgetConsultationEntry,
   loadConsultationAudio,
   replyToMentor,
   sendUtterance,
@@ -37,12 +35,10 @@ export function useConsultationSession(
 ) {
   const aiMode = useQuery(configQuery).data?.aiMode ?? "real";
   const [state, dispatch] = useReducer(consultationReducer, undefined, createConsultationState);
-  const queryClient = useQueryClient();
 
   const recordingRef = useRef<Promise<Recording> | null>(null);
   const utteranceRef = useRef<Utterance | null>(null);
   const placedRef = useRef<ConsultationState["shown"]>(null);
-  const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const audioRef = useRef<{ turnId: string; src: Promise<string> } | null>(null);
 
   // 期限。達したら、状態ごとの扱いは reducer が決める
@@ -235,21 +231,6 @@ export function useConsultationSession(
       active = false;
     };
   }, [state.seq, entry.consultationId]);
-
-  // 画面を離れると、相談を中断する。開発時の二重の実行では、直前の中断を取り消す
-  useEffect(() => {
-    clearTimeout(leaveTimerRef.current);
-    const leave = () => {
-      // 中断した相談の開始の結果は捨てる。戻る、進むで来ても、中断された相談は出さない
-      forgetConsultationEntry(queryClient, entry.materialId);
-      void abandonConsultation(entry.consultationId, { keepalive: true }).catch(() => undefined);
-    };
-    window.addEventListener("pagehide", leave);
-    return () => {
-      window.removeEventListener("pagehide", leave);
-      leaveTimerRef.current = setTimeout(leave, 0);
-    };
-  }, [entry.consultationId, entry.materialId, queryClient]);
 
   /** 「話す」と「話し終える」。同じボタンで、状態に応じて働く */
   const pressTalk = () => {

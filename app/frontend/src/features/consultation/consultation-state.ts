@@ -137,6 +137,17 @@ function toEnded(state: ConsultationState, patch: Partial<Shared> = {}): Consult
   return { ...enter(state, { ...patch, notice: ENDED_MESSAGE }), phase: "ended" };
 }
 
+/** 保留中の応答 (期限に達している) は、音声なしで字幕だけ出してから区切る (architecture 5.2) */
+function endWithSubtitle(state: ConsultationState, speech: Speech): ConsultationState {
+  return toEnded(state, {
+    subtitles: [...state.subtitles, { speaker: "mentor", text: speech.text }],
+    expression: speech.expression,
+    gesture: "nod",
+    shown: { boardWrites: speech.boardWrites },
+    timeUp: true,
+  });
+}
+
 /** 相談の進行の遷移。仕様書 5.4 と architecture 5.2 の規則に従い、合わない事象は無視する */
 export function consultationReducer(
   state: ConsultationState,
@@ -185,6 +196,10 @@ export function consultationReducer(
       if (state.phase !== "awaitingReply") {
         return state;
       }
+      if (state.timeUp) {
+        // 応答を待つ間に期限に達していた。ペンを待たずに、字幕だけ出して区切る
+        return endWithSubtitle(state, event.speech);
+      }
       return {
         ...enter(state, { expression: "normal", gesture: "nod" }),
         phase: "holding",
@@ -225,13 +240,7 @@ export function consultationReducer(
           return toEnded(state);
         case "holding":
           // 保留中の応答は、音声なしで字幕だけ出してから区切る (architecture 5.2)
-          return toEnded(state, {
-            subtitles: [...state.subtitles, { speaker: "mentor", text: state.speech.text }],
-            expression: state.speech.expression,
-            gesture: "nod",
-            shown: { boardWrites: state.speech.boardWrites },
-            timeUp: true,
-          });
+          return endWithSubtitle(state, state.speech);
         case "ended":
           return state;
         default:
