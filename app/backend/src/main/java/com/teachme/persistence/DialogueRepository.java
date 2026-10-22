@@ -3,6 +3,7 @@ package com.teachme.persistence;
 import static com.teachme.persistence.generated.Tables.CONSULTATIONS;
 import static com.teachme.persistence.generated.Tables.DIALOGUE_TURNS;
 import static com.teachme.persistence.generated.Tables.LESSONS;
+import static com.teachme.persistence.generated.Tables.USER_SETTINGS;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -178,6 +179,12 @@ public final class DialogueRepository {
     dsl.transaction(
         configuration -> {
           DSLContext tx = DSL.using(configuration);
+          // 利用者の設定の行を先に取り、同じ利用者の開始どうしを直列にする (複数のタブや再送で、進行中の授業が複数残らないように)
+          tx.selectOne()
+              .from(USER_SETTINGS)
+              .where(USER_SETTINGS.USER_ID.eq(userId))
+              .forUpdate()
+              .fetch();
           tx.deleteFrom(LESSONS).where(LESSONS.USER_ID.eq(userId)).execute();
           tx.insertInto(LESSONS)
               .set(LESSONS.ID, lessonId)

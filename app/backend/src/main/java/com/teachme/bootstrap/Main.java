@@ -4,8 +4,6 @@ import com.teachme.ai.LanguageModel;
 import com.teachme.ai.SpeechToText;
 import com.teachme.ai.TextToSpeech;
 import com.teachme.ai.fake.FakeAi;
-import com.teachme.ai.real.NotConfiguredLanguageModel;
-import com.teachme.ai.real.NotConfiguredSpeech;
 import com.teachme.application.DialogueService;
 import com.teachme.application.DialogueSweeper;
 import com.teachme.application.HomeService;
@@ -56,10 +54,21 @@ public final class Main {
     boolean fake = config.aiMode() == AppConfig.AiMode.FAKE;
     FakeAi fakeAi = new FakeAi();
     TestControlService testControl = new TestControlService(fakeAi);
-    // 実際の LLM と音声の実装は、まだ無い。real では、呼び出しを失敗として返す
-    LanguageModel languageModel = fake ? fakeAi : new NotConfiguredLanguageModel();
-    SpeechToText speechToText = fake ? fakeAi : new NotConfiguredSpeech();
-    TextToSpeech textToSpeech = fake ? fakeAi : new NotConfiguredSpeech();
+    LanguageModel languageModel;
+    SpeechToText speechToText;
+    TextToSpeech textToSpeech;
+    if (fake) {
+      languageModel = fakeAi;
+      speechToText = fakeAi;
+      textToSpeech = fakeAi;
+    } else {
+      // real では、設定 (秘密情報を含む) を読んだ外部 AI の実装を使う
+      LlmConfig llm = config.llm().orElseThrow();
+      ElevenLabsConfig elevenLabs = config.elevenLabs().orElseThrow();
+      languageModel = RealAi.languageModel(llm);
+      speechToText = RealAi.speechToText(elevenLabs);
+      textToSpeech = RealAi.textToSpeech(elevenLabs);
+    }
     // 授業の時間の上限は、テストの上書きを反映する。real では上書きは無い
     Function<UUID, DialogueLimits> lessonLimits =
         fake ? testControl::lessonLimits : userId -> DialogueLimits.lesson();

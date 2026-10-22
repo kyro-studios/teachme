@@ -3,10 +3,26 @@ package com.teachme.application;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.teachme.ai.AiCallContext;
 import com.teachme.ai.AiCallKind;
+import com.teachme.ai.LanguageModel;
+import com.teachme.ai.LanguageModel.Evaluation;
+import com.teachme.ai.LanguageModel.EvaluationInput;
+import com.teachme.ai.LanguageModel.HomeworkJudgement;
+import com.teachme.ai.LanguageModel.MentorReply;
+import com.teachme.ai.LanguageModel.MentorReplyInput;
+import com.teachme.ai.LanguageModel.MockExamInput;
+import com.teachme.ai.LanguageModel.MockExamResult;
+import com.teachme.ai.LanguageModel.OrganizeResult;
+import com.teachme.ai.LanguageModel.StudentReply;
+import com.teachme.ai.LanguageModel.StudentReplyInput;
+import com.teachme.ai.LanguageModel.SummaryInput;
+import com.teachme.ai.LanguageModel.SummaryResult;
+import com.teachme.ai.Media;
 import com.teachme.ai.ScriptedResponse;
 import com.teachme.ai.fake.FakeAi;
 import com.teachme.application.DialogueService.Recording;
@@ -38,6 +54,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -72,23 +95,27 @@ class LessonServiceTest {
     clock = new MutableClock(START, Fixtures.JAPAN);
     settings = new SettingsService(repositories.settings(), clock);
     fakeAi = new FakeAi();
-    DialogueService dialogue =
-        new DialogueService(settings, repositories.dialogues(), fakeAi, fakeAi, clock);
-    lessons =
-        new LessonService(
-            settings,
-            dialogue,
-            repositories.dialogues(),
-            repositories.materials(),
-            repositories.todayModes(),
-            repositories.lessonRecords(),
-            fakeAi,
-            id -> DialogueLimits.lesson(),
-            clock);
     settings.save(USER, command("二次関数"));
     settings.save(OTHER, command("三角比"));
+    lessons = lessonsWith(fakeAi);
     unitId = settings.find(USER).orElseThrow().unitId();
     materialId = organizedMaterial(unitId);
+  }
+
+  /** 外部 AI を差し替えた授業のサービス。他は、setUp の授業のサービスと同じ部品を使う。 */
+  private LessonService lessonsWith(LanguageModel llm) {
+    DialogueService dialogue =
+        new DialogueService(settings, repositories.dialogues(), fakeAi, fakeAi, clock);
+    return new LessonService(
+        settings,
+        dialogue,
+        repositories.dialogues(),
+        repositories.materials(),
+        repositories.todayModes(),
+        repositories.lessonRecords(),
+        llm,
+        id -> DialogueLimits.lesson(),
+        clock);
   }
 
   private static SettingsCommand command(String unitName) {
@@ -378,6 +405,83 @@ class LessonServiceTest {
   }
 
   @Test
+  void 生徒の応答が失敗しても_学習評価の完了を待ってから返し_待っている間は_busy_になる() throws Exception {
+    UUID lessonId = startLesson();
+    UUID utteranceId = utter(lessonId);
+    fakeAi.script(
+        USER, AiCallKind.STUDENT_REPLY, List.of(new ScriptedResponse(false, null)), false);
+    GatedAi gated = new GatedAi(fakeAi, AiCallKind.EVALUATION);
+    LessonService gatedLessons = lessonsWith(gated);
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<Reply> future =
+          executor.submit(() -> gatedLessons.reply(USER, lessonId, utteranceId, PNG, List.of()));
+      gated.awaitEntered();
+
+      // 学習評価が終わるまで、応答は終わらない。その間は次の発話を受け付けない
+      assertThrows(TimeoutException.class, () -> future.get(200, TimeUnit.MILLISECONDS));
+      ConflictException busy =
+          assertThrows(ConflictException.class, () -> lessons.utter(USER, lessonId, RECORDING));
+      assertEquals("busy", busy.code());
+
+      gated.release();
+      ExecutionException e = assertThrows(ExecutionException.class, future::get);
+      assertInstanceOf(ExternalFailureException.class, e.getCause());
+      assertEquals("student_reply_failed", ((ExternalFailureException) e.getCause()).code());
+      assertEquals(1, calls(AiCallKind.EVALUATION));
+      assertEquals(0, DialogueFixtures.lessonRoundCount(dataSource, lessonId));
+      // 応答が終わった後は、話し直せる
+      assertTrue(lessons.utter(USER, lessonId, RECORDING).isPresent());
+    } finally {
+      gated.release();
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void まとめの作成の最中に中断すると_記録せず_理解度も変えない() throws Exception {
+    UUID lessonId = startLesson();
+    roundTrip(lessonId);
+    clock.advance(NEAR_DEADLINE);
+    GatedAi gated = new GatedAi(fakeAi, AiCallKind.SUMMARY);
+    LessonService gatedLessons = lessonsWith(gated);
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<Summary> future = executor.submit(() -> gatedLessons.summarize(USER, lessonId, PNG));
+      gated.awaitEntered();
+
+      // まとめの LLM の呼び出しの間に中断し、その後で生成を完了させる
+      lessons.abandon(USER, lessonId);
+      gated.release();
+
+      ExecutionException e = assertThrows(ExecutionException.class, future::get);
+      assertInstanceOf(NotFoundException.class, e.getCause());
+      assertEquals(0, queryInt("select count(*) from lesson_records"));
+      assertEquals(0, queryInt("select count(*) from lessons where id = ?", lessonId));
+      assertEquals(0, DialogueFixtures.countTurns(dataSource, lessonId));
+      assertEquals(0, unitUnderstanding());
+      assertEquals(0, repositories.units().lessonsSinceExam(unitId));
+    } finally {
+      gated.release();
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  void まとめが先に記録された後に中断しても_記録は残る() {
+    UUID lessonId = startLesson();
+    roundTrip(lessonId);
+    clock.advance(NEAR_DEADLINE);
+    lessons.summarize(USER, lessonId, PNG);
+
+    lessons.abandon(USER, lessonId);
+
+    assertEquals(1, queryInt("select count(*) from lesson_records where id = ?", lessonId));
+    assertEquals(15, unitUnderstanding());
+    assertEquals(1, repositories.units().lessonsSinceExam(unitId));
+  }
+
+  @Test
   void 授業の行が無ければ_確定は何も残さない() {
     Optional<RecordedLesson> recorded =
         repositories
@@ -416,5 +520,82 @@ class LessonServiceTest {
     assertEquals(0, queryInt("select count(*) from lessons where id = ?", old));
     assertEquals(1, queryInt("select count(*) from lessons where id = ?", recent));
     assertEquals(0, queryInt("select count(*) from consultations where id = ?", oldConsultation));
+  }
+
+  /**
+   * 指定した種類の呼び出しを、解放されるまで待たせる LLM。待っている間の他の処理を確かめるために使う。
+   *
+   * <p>待たせる前に、呼び出しに入ったことを {@link #awaitEntered} で待てる。
+   */
+  private static final class GatedAi implements LanguageModel {
+
+    private final LanguageModel delegate;
+    private final AiCallKind gated;
+    private final CountDownLatch entered = new CountDownLatch(1);
+    private final CountDownLatch released = new CountDownLatch(1);
+
+    GatedAi(LanguageModel delegate, AiCallKind gated) {
+      this.delegate = delegate;
+      this.gated = gated;
+    }
+
+    void awaitEntered() throws InterruptedException {
+      assertTrue(entered.await(5, TimeUnit.SECONDS));
+    }
+
+    void release() {
+      released.countDown();
+    }
+
+    private void gate(AiCallKind kind) {
+      if (kind != gated) {
+        return;
+      }
+      entered.countDown();
+      try {
+        released.await();
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException(e);
+      }
+    }
+
+    @Override
+    public OrganizeResult organize(AiCallContext context, List<Media> images) {
+      return delegate.organize(context, images);
+    }
+
+    @Override
+    public StudentReply studentReply(AiCallContext context, StudentReplyInput input) {
+      gate(context.kind());
+      return delegate.studentReply(context, input);
+    }
+
+    @Override
+    public Evaluation evaluate(AiCallContext context, EvaluationInput input) {
+      gate(context.kind());
+      return delegate.evaluate(context, input);
+    }
+
+    @Override
+    public MentorReply mentorReply(AiCallContext context, MentorReplyInput input) {
+      return delegate.mentorReply(context, input);
+    }
+
+    @Override
+    public SummaryResult summarize(AiCallContext context, SummaryInput input) {
+      gate(context.kind());
+      return delegate.summarize(context, input);
+    }
+
+    @Override
+    public MockExamResult mockExam(AiCallContext context, MockExamInput input) {
+      return delegate.mockExam(context, input);
+    }
+
+    @Override
+    public HomeworkJudgement gradeHomework(AiCallContext context, Media photo) {
+      return delegate.gradeHomework(context, photo);
+    }
   }
 }

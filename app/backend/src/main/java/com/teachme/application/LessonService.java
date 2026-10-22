@@ -293,6 +293,8 @@ public final class LessonService {
                           regions)),
               PARALLEL);
 
+      // 失敗しても、両方が終わってから返す。途中で閉じると、評価の呼び出しの間に次の処理が入る
+      CompletableFuture.allOf(studentReply, evaluation).handle((done, failed) -> null).join();
       StudentReply reply = awaitStudentReply(studentReply);
       Optional<Annotation> annotation = toAnnotation(reply.annotation());
       Expression expression = toExpression(reply.expression());

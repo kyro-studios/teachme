@@ -83,16 +83,27 @@ public final class OpenAiLanguageModel implements LanguageModel {
 
   @Override
   public StudentReply studentReply(AiCallContext context, StudentReplyInput input) {
-    List<Part> parts =
-        List.of(
-            text(
-                section("問題文", input.problemText())
-                    + section("生徒の途中の解答", input.studentWork())
-                    + section("先生の発話", input.utterance())
-                    + section("これまでの字幕", subtitles(input.subtitles()))
-                    + section("指している範囲", regions(input.pointedRegions()))
-                    + "次の画像は、ボードの現在の内容です。"),
-            new Part.Image(input.boardImage()));
+    List<Part> parts = new ArrayList<>();
+    if (input.boardImage() == null) {
+      // 授業の最初の発話は、ボードの画像が無い (問題文と途中の解答だけで作る)
+      parts.add(
+          text(
+              section("問題文", input.problemText())
+                  + section("生徒の途中の解答", input.studentWork())
+                  + section("先生の発話", input.utterance())
+                  + section("これまでの字幕", subtitles(input.subtitles()))
+                  + section("指している範囲", regions(input.pointedRegions()))));
+    } else {
+      parts.add(
+          text(
+              section("問題文", input.problemText())
+                  + section("生徒の途中の解答", input.studentWork())
+                  + section("先生の発話", input.utterance())
+                  + section("これまでの字幕", subtitles(input.subtitles()))
+                  + section("指している範囲", regions(input.pointedRegions()))
+                  + "次の画像は、ボードの現在の内容です。"));
+      parts.add(new Part.Image(input.boardImage()));
+    }
     JsonNode node =
         client.complete(
             new Request(
