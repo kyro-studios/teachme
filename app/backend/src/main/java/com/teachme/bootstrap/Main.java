@@ -12,6 +12,7 @@ import com.teachme.application.HomeworkService;
 import com.teachme.application.LessonService;
 import com.teachme.application.MaterialOrganizer;
 import com.teachme.application.MaterialService;
+import com.teachme.application.MockExamService;
 import com.teachme.application.SettingsService;
 import com.teachme.application.TestControlService;
 import com.teachme.domain.DialogueLimits;
@@ -20,6 +21,7 @@ import com.teachme.web.ConsultationRoutes;
 import com.teachme.web.HomeRoutes;
 import com.teachme.web.LessonRoutes;
 import com.teachme.web.MaterialRoutes;
+import com.teachme.web.MockExamRoutes;
 import com.teachme.web.Routes;
 import com.teachme.web.SettingsRoutes;
 import com.teachme.web.SystemRoutes;
@@ -90,7 +92,7 @@ public final class Main {
     return routes;
   }
 
-  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ、教材、授業、先輩先生への相談)。 */
+  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ、教材、授業、先輩先生への相談、模試)。 */
   private static List<Routes> userRoutes(
       Components components,
       LanguageModel languageModel,
@@ -136,12 +138,20 @@ public final class Main {
             languageModel,
             consultationLimits,
             components.clock());
+    MockExamService mockExams =
+        new MockExamService(
+            settings,
+            repositories.mockExams(),
+            repositories.materials(),
+            languageModel,
+            components.clock());
     DialogueSweeper sweeper = new DialogueSweeper(repositories.dialogues(), components.clock());
     return List.of(
         new SettingsRoutes(settings),
         new HomeRoutes(home, homework),
         new MaterialRoutes(materials, organizer),
         new LessonRoutes(lessons, sweeper),
-        new ConsultationRoutes(consultations));
+        new ConsultationRoutes(consultations),
+        new MockExamRoutes(mockExams));
   }
 }
