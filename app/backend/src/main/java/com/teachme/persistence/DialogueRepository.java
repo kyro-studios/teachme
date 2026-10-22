@@ -4,14 +4,20 @@ import static com.teachme.persistence.generated.Tables.CONSULTATIONS;
 import static com.teachme.persistence.generated.Tables.DIALOGUE_TURNS;
 import static com.teachme.persistence.generated.Tables.LESSONS;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.teachme.domain.Annotation;
 import com.teachme.domain.Degrees;
 import com.teachme.domain.DialogueKind;
+import com.teachme.domain.Expression;
+import com.teachme.domain.OrganizedProblem;
 import com.teachme.domain.Speaker;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import org.jooq.DSLContext;
@@ -40,8 +46,9 @@ public final class DialogueRepository {
    *
    * @param roundCount 往復の数
    * @param deadlineAt 期限
+   * @param materialId 使う教材の識別子
    */
-  public record ParentState(int roundCount, Instant deadlineAt) {}
+  public record ParentState(int roundCount, Instant deadlineAt, UUID materialId) {}
 
   /**
    * 字幕の 1 行。
@@ -50,6 +57,13 @@ public final class DialogueRepository {
    */
   public record TurnRow(
       Speaker speaker, String body, boolean replied, boolean audioAttempted, byte[] audio) {}
+
+  /**
+   * 字幕の、話し手と文章。順序は、字幕の追加の順 (`seq`)。
+   *
+   * @param id 字幕の識別子
+   */
+  public record Subtitle(UUID id, Speaker speaker, String body) {}
 
   /**
    * 確定した応答の結果。
@@ -65,7 +79,35 @@ public final class DialogueRepository {
    * @param expression 生徒や先輩先生の表情。無ければ null
    * @param extras 生徒の印、または先輩先生のボードへの書き込み (JSON の文字列)。無ければ null
    */
-  public record NewTurn(Speaker speaker, String body, String expression, String extras) {}
+  public record NewTurn(Speaker speaker, String body, String expression, String extras) {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /**
+     * 生徒の字幕。生徒の印は、字幕の追加情報 (JSON) として入れる。
+     *
+     * @param annotation ボードに示す印。無ければ空
+     */
+    public static NewTurn student(
+        String body, Expression expression, Optional<Annotation> annotation) {
+      return new NewTurn(
+          Speaker.STUDENT,
+          body,
+          expression.wireName(),
+          annotation.map(NewTurn::annotationJson).orElse(null));
+    }
+
+    private static String annotationJson(Annotation annotation) {
+      try {
+        return JSON.writeValueAsString(
+            new StoredAnnotation(annotation.kind().wireName(), annotation.region()));
+      } catch (JsonProcessingException e) {
+        throw new IllegalStateException("生徒の印を JSON にできません", e);
+      }
+    }
+
+    private record StoredAnnotation(String kind, OrganizedProblem.Region region) {}
+  }
 
   /** 親の行の、この機能で使う列。授業と相談で列の名前が違うため、まとめて持つ。 */
   private record Parent(
@@ -73,8 +115,10 @@ public final class DialogueRepository {
       Field<UUID> id,
       Field<UUID> userId,
       Field<Short> roundCount,
+      Field<OffsetDateTime> startedAt,
       Field<OffsetDateTime> deadlineAt,
       Field<OffsetDateTime> busySince,
+      Field<UUID> materialId,
       Field<UUID> turnParentId) {
 
     static Parent of(DialogueKind kind) {
@@ -85,8 +129,10 @@ public final class DialogueRepository {
                 LESSONS.ID,
                 LESSONS.USER_ID,
                 LESSONS.ROUND_COUNT,
+                LESSONS.STARTED_AT,
                 LESSONS.DEADLINE_AT,
                 LESSONS.BUSY_SINCE,
+                LESSONS.MATERIAL_ID,
                 DIALOGUE_TURNS.LESSON_ID);
         case CONSULTATION ->
             new Parent(
@@ -94,8 +140,10 @@ public final class DialogueRepository {
                 CONSULTATIONS.ID,
                 CONSULTATIONS.USER_ID,
                 CONSULTATIONS.ROUND_COUNT,
+                CONSULTATIONS.STARTED_AT,
                 CONSULTATIONS.DEADLINE_AT,
                 CONSULTATIONS.BUSY_SINCE,
+                CONSULTATIONS.MATERIAL_ID,
                 DIALOGUE_TURNS.CONSULTATION_ID);
       };
     }
@@ -104,11 +152,81 @@ public final class DialogueRepository {
   /** 利用者の、進行中の親の行の状態。無ければ (ほかの利用者のもの、中断された後も含む) 空。 */
   public Optional<ParentState> findParent(DialogueKind kind, UUID userId, UUID parentId) {
     Parent parent = Parent.of(kind);
-    return dsl.select(parent.roundCount(), parent.deadlineAt())
+    return dsl.select(parent.roundCount(), parent.deadlineAt(), parent.materialId())
         .from(parent.table())
         .where(parent.id().eq(parentId))
         .and(parent.userId().eq(userId))
-        .fetchOptional(row -> new ParentState(row.value1().intValue(), row.value2().toInstant()));
+        .fetchOptional(
+            row ->
+                new ParentState(row.value1().intValue(), row.value2().toInstant(), row.value3()));
+  }
+
+  /**
+   * 授業を始める。同じ利用者の進行中の授業は、中断として消す (字幕も連鎖して消える)。新しい授業と、最初の発話 (生徒の字幕) を、1 つのトランザクションで入れる。
+   *
+   * @param turnId 最初の発話の字幕の識別子
+   */
+  public void startLesson(
+      UUID userId,
+      UUID unitId,
+      UUID materialId,
+      UUID lessonId,
+      Instant startedAt,
+      Instant deadlineAt,
+      UUID turnId,
+      NewTurn opening) {
+    dsl.transaction(
+        configuration -> {
+          DSLContext tx = DSL.using(configuration);
+          tx.deleteFrom(LESSONS).where(LESSONS.USER_ID.eq(userId)).execute();
+          tx.insertInto(LESSONS)
+              .set(LESSONS.ID, lessonId)
+              .set(LESSONS.USER_ID, userId)
+              .set(LESSONS.UNIT_ID, unitId)
+              .set(LESSONS.MATERIAL_ID, materialId)
+              .set(LESSONS.STARTED_AT, toOffsetDateTime(startedAt))
+              .set(LESSONS.DEADLINE_AT, toOffsetDateTime(deadlineAt))
+              .execute();
+          insertTurn(tx, Parent.of(DialogueKind.LESSON), lessonId, turnId, opening);
+        });
+  }
+
+  /** 利用者の進行中の親の行を消す (中断)。字幕も連鎖して消える。無ければ何もしない。 */
+  public void deleteParent(DialogueKind kind, UUID userId, UUID parentId) {
+    Parent parent = Parent.of(kind);
+    dsl.deleteFrom(parent.table())
+        .where(parent.id().eq(parentId))
+        .and(parent.userId().eq(userId))
+        .execute();
+  }
+
+  /**
+   * 開始から threshold より前に始まった、進行中の親の行を消す (掃除)。字幕も連鎖して消える。
+   *
+   * @return 消した件数
+   */
+  public int deleteStartedBefore(DialogueKind kind, Instant threshold) {
+    Parent parent = Parent.of(kind);
+    return dsl.deleteFrom(parent.table())
+        .where(parent.startedAt().lessThan(toOffsetDateTime(threshold)))
+        .execute();
+  }
+
+  /**
+   * 利用者の進行中の親の字幕を、追加の順に返す。ほかの利用者のもの、無い親のものは空。
+   *
+   * @return 字幕の列。利用者の字幕も含む
+   */
+  public List<Subtitle> listSubtitles(DialogueKind kind, UUID userId, UUID parentId) {
+    Parent parent = Parent.of(kind);
+    return dsl.select(DIALOGUE_TURNS.ID, DIALOGUE_TURNS.SPEAKER, DIALOGUE_TURNS.BODY)
+        .from(DIALOGUE_TURNS)
+        .join(parent.table())
+        .on(parent.id().eq(parent.turnParentId()))
+        .where(parent.turnParentId().eq(parentId))
+        .and(parent.userId().eq(userId))
+        .orderBy(DIALOGUE_TURNS.SEQ)
+        .fetch(row -> new Subtitle(row.value1(), Speaker.fromWireName(row.value2()), row.value3()));
   }
 
   /**

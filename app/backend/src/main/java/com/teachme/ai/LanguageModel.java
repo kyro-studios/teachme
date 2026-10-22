@@ -70,8 +70,11 @@ public interface LanguageModel {
   /**
    * 生徒の応答の入力。模範解答、解説、指導のポイント、学習評価は持たない (仕様書 5.5)。
    *
+   * <p>授業の最初の発話では、ボードの画像と発話は無いため null、字幕と指している範囲は空を渡す。
+   *
    * @param studentWork 生徒の途中の解答
-   * @param boardImage ボードの画像
+   * @param boardImage ボードの画像。最初の発話では null
+   * @param utterance 利用者の発話。最初の発話では null
    * @param pointedRegions 指している範囲。無ければ空
    */
   record StudentReplyInput(

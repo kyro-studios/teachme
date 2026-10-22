@@ -151,7 +151,8 @@ public final class DialogueService {
         throw new ConflictException(ALREADY_REPLIED_CODE, ALREADY_REPLIED_MESSAGE);
       }
       checkLimit(kind, parent);
-      return new ReplyTicket(kind, userId, parentId, utteranceId, utterance.body(), busySince);
+      return new ReplyTicket(
+          kind, userId, parentId, utteranceId, utterance.body(), busySince, parent);
     } catch (RuntimeException e) {
       dialogues.releaseBusy(kind, parentId, busySince);
       throw e;
@@ -211,8 +212,12 @@ public final class DialogueService {
     }
   }
 
-  /** 設定が完了し、個人情報の確認が済んでいることを確かめる。 */
-  private void requireReady(UUID userId) {
+  /**
+   * 授業と相談の API が使えるか確かめる。設定が完了し、個人情報の確認が済んでいること。
+   *
+   * @throws ConflictException 設定が未完了 (`setup_required`)、または個人情報の確認が無い (`privacy_not_confirmed`)
+   */
+  public void requireReady(UUID userId) {
     if (!settings.requireCompleted(userId).privacyConfirmed()) {
       throw new ConflictException(PRIVACY_NOT_CONFIRMED_CODE, PRIVACY_NOT_CONFIRMED_MESSAGE);
     }
@@ -279,6 +284,36 @@ public final class DialogueService {
     return new ExternalFailureException(TTS_FAILED_CODE, TTS_FAILED_MESSAGE);
   }
 
+  /** 処理中の印だけを立てた札。閉じると印が外れる。まとめの作成のように、確定まで対話の他の処理を止める処理に使う。 */
+  public Processing beginProcessing(DialogueKind kind, UUID userId, UUID parentId) {
+    requireReady(userId);
+    Instant busySince = beginBusy(kind, userId, parentId);
+    return new Processing(kind, parentId, busySince);
+  }
+
+  /** 処理中の印を持つ札。閉じると、印が外れる。 */
+  public final class Processing implements AutoCloseable {
+
+    private final DialogueKind kind;
+    private final UUID parentId;
+    private final Instant busySince;
+    private boolean open = true;
+
+    private Processing(DialogueKind kind, UUID parentId, Instant busySince) {
+      this.kind = kind;
+      this.parentId = parentId;
+      this.busySince = busySince;
+    }
+
+    @Override
+    public void close() {
+      if (open) {
+        open = false;
+        dialogues.releaseBusy(kind, parentId, busySince);
+      }
+    }
+  }
+
   /**
    * 応答の途中であることを表す札。処理中の印を持ち、閉じると印が外れる。
    *
@@ -292,6 +327,7 @@ public final class DialogueService {
     private final UUID utteranceId;
     private final String utteranceText;
     private final Instant busySince;
+    private final ParentState parent;
     private boolean open = true;
 
     private ReplyTicket(
@@ -300,13 +336,20 @@ public final class DialogueService {
         UUID parentId,
         UUID utteranceId,
         String utteranceText,
-        Instant busySince) {
+        Instant busySince,
+        ParentState parent) {
       this.kind = kind;
       this.userId = userId;
       this.parentId = parentId;
       this.utteranceId = utteranceId;
       this.utteranceText = utteranceText;
       this.busySince = busySince;
+      this.parent = parent;
+    }
+
+    /** 応答を始めた時点の、親の行の状態 (期限と、使う教材の識別子)。往復の数は、応答の確定の結果を使う。 */
+    public ParentState parent() {
+      return parent;
     }
 
     public DialogueKind kind() {
