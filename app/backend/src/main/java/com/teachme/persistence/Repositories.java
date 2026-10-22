@@ -12,6 +12,7 @@ public final class Repositories {
   private final TodayModeRepository todayModes;
   private final LessonRecordRepository lessonRecords;
   private final UnitRepository units;
+  private final DialogueRepository dialogues;
   private final MaterialRepository materials;
 
   public Repositories(DataSource dataSource) {
@@ -20,6 +21,7 @@ public final class Repositories {
     this.todayModes = new TodayModeRepository(dsl);
     this.lessonRecords = new LessonRecordRepository(dsl);
     this.units = new UnitRepository(dsl);
+    this.dialogues = new DialogueRepository(dsl);
     this.materials = new MaterialRepository(dsl);
   }
 
@@ -37,6 +39,10 @@ public final class Repositories {
 
   public UnitRepository units() {
     return units;
+  }
+
+  public DialogueRepository dialogues() {
+    return dialogues;
   }
 
   public MaterialRepository materials() {

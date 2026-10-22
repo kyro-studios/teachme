@@ -1,7 +1,9 @@
 package com.teachme.web;
 
 import com.teachme.application.ConflictException;
+import com.teachme.application.ExternalFailureException;
 import com.teachme.application.InvalidInputException;
+import com.teachme.application.NotFoundException;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpResponseException;
@@ -27,6 +29,10 @@ final class ApiErrors {
     app.exception(
         ConflictException.class,
         (e, ctx) -> ctx.status(409).json(ErrorResponse.of(e.code(), e.getMessage(), null)));
+    app.exception(NotFoundException.class, (e, ctx) -> notFound(ctx));
+    app.exception(
+        ExternalFailureException.class,
+        (e, ctx) -> ctx.status(502).json(ErrorResponse.of(e.code(), e.getMessage(), null)));
     app.exception(
         InvalidInputException.class,
         (e, ctx) ->

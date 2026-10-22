@@ -10,6 +10,12 @@ import java.util.UUID;
  * @param unitId 現在の単元の識別子
  * @param unitName 現在の単元の名前
  * @param lessonsPerWeek 週の授業回数
+ * @param privacyConfirmed 個人情報の確認のチェック。授業と相談の API は、これが true でなければ使えない (openapi.yaml の決まり)
  */
 public record UserSettings(
-    StudentType studentType, Subject subject, UUID unitId, String unitName, int lessonsPerWeek) {}
+    StudentType studentType,
+    Subject subject,
+    UUID unitId,
+    String unitName,
+    int lessonsPerWeek,
+    boolean privacyConfirmed) {}
