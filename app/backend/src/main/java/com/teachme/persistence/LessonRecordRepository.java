@@ -157,7 +157,8 @@ public final class LessonRecordRepository {
     }
   }
 
-  private static List<String> fromJsonQuotes(JSONB quotes) {
+  /** 保存された引用する板書 (JSON の配列) を読む。学習記録の集計 ({@link RecordRepository}) と共有する。 */
+  static List<String> fromJsonQuotes(JSONB quotes) {
     try {
       return JSON.readValue(quotes.data(), STRING_LIST);
     } catch (JsonProcessingException e) {
