@@ -9,6 +9,7 @@ export type LessonReply = components["schemas"]["LessonReply"];
 export type UtteranceResult = components["schemas"]["UtteranceResult"];
 export type MaterialSummary = components["schemas"]["MaterialSummary"];
 export type Region = components["schemas"]["Region"];
+export type LessonSummary = components["schemas"]["LessonSummary"];
 
 /**
  * 授業の画面が受け取るもの。開始の結果に、次の 2 つを足す
@@ -81,6 +82,16 @@ export function replyToUtterance(
     method: "POST",
     body,
   });
+}
+
+/**
+ * チャイムの後の、まとめノートの作成 (`POST /lessons/{id}/summary`)。
+ * チャイムの時点のボードの画像を送る。失敗したときは、同じ画像で「やり直す」ができる
+ */
+export function createLessonSummary(lessonId: string, boardImage: Blob): Promise<LessonSummary> {
+  const body = new FormData();
+  body.append("boardImage", boardImage, "board.png");
+  return apiFetch<LessonSummary>(`/lessons/${lessonId}/summary`, { method: "POST", body });
 }
 
 /** 授業を中断する (`POST /lessons/{id}/abandon`)。画面を離れるときは、`keepalive` で送る */

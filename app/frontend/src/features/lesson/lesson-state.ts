@@ -1,5 +1,5 @@
 // 授業の進行の状態機械 (architecture 5.2)。この reducer は副作用を持たず、録音、API、音声、ボードは画面の側が行う。
-// 状態の名前と遷移は、仕様書 7.3 と architecture 5.2 に合わせる。まとめ (`summarizing`) は、fe-lesson-summary で足す。
+// 状態の名前と遷移は、仕様書 7.3 と architecture 5.2 に合わせる。
 import type { components } from "../../api/schema";
 import type { AvatarExpression, AvatarGesture } from "../../shared/avatar/avatar-model";
 
@@ -7,6 +7,9 @@ type Expression = components["schemas"]["Expression"];
 type StudentAnnotation = components["schemas"]["StudentAnnotation"];
 type Turn = components["schemas"]["Turn"];
 type LessonReply = components["schemas"]["LessonReply"];
+
+/** まとめノートの中身 (仕様書 5.6)。授業の直後の表示と、記録の画面で使う */
+export type SummaryNote = { summaryText: string; quotes: readonly string[] };
 
 /** 認識が空か失敗したとき (仕様書 5.5) */
 export const RECOGNITION_FAILED_MESSAGE = "うまく聞き取れませんでした。もう一度話してください";
@@ -19,6 +22,9 @@ export const RECORDING_FAILED_MESSAGE = "録音できませんでした。もう
 
 /** チャイムの文言 (仕様書 5.5、10 節) */
 export const CHIME_MESSAGE = "チャイムが鳴りました。授業のまとめに入ります";
+
+/** まとめの作成が失敗したとき (仕様書 5.6) */
+export const SUMMARY_FAILED_MESSAGE = "まとめノートを作れませんでした";
 
 /** 相槌 (仕様書 5.5)。認識の結果を受けた直後に、1 つだけ出す。字幕には残さない */
 export const FILLERS = ["えーっと…", "なるほど！", "ふむ…"] as const;
@@ -62,7 +68,12 @@ type Phased =
   | { phase: "awaitingReply"; utteranceId: string }
   | { phase: "holding"; speech: Speech }
   | { phase: "speaking"; speech: Speech }
-  | { phase: "chime" };
+  | { phase: "chime" }
+  /** まとめの作成 (LLM) を待つ。チャイムの後、自動で始める */
+  | { phase: "summarizing" }
+  | { phase: "summaryFailed" }
+  /** まとめノートを表示している。記録は済んでいる (授業の終わり) */
+  | { phase: "summarized"; summary: SummaryNote };
 
 export type LessonState = Shared & Phased;
 
@@ -86,7 +97,15 @@ export type LessonEvent =
   /** 字幕と音声が終わった。音声が出せなかったときも、この事象で続ける */
   | { type: "speechEnded" }
   /** 時計が期限に達した */
-  | { type: "timeUp" };
+  | { type: "timeUp" }
+  /** チャイムの後、まとめの作成を始める (チャイム時点のボードの画像は用意できている) */
+  | { type: "summarize" }
+  /** まとめの作成が成功した */
+  | { type: "summarized"; summary: SummaryNote }
+  /** まとめの作成が失敗した。チャイムの時点で、ボードの画像を用意できなかったときも含む */
+  | { type: "summaryFailed" }
+  /** 「やり直す」。同じボードの画像で、まとめの作成をもう一度行う */
+  | { type: "retrySummary" };
 
 /** 授業の開始の発話から、最初の状態を作る。開始の発話は往復に数えない */
 export function createLessonState(opening: Speech): LessonState {
@@ -240,6 +259,25 @@ export function lessonReducer(state: LessonState, event: LessonEvent): LessonSta
       }
       return state.speech.limitReached ? toChime(state) : endTurn(state, { gesture: "nod" });
 
+    case "summarize":
+      return state.phase === "chime" ? { ...enter(state), phase: "summarizing" } : state;
+
+    case "summarized":
+      // まとめノートを表示する。チャイムの文言は、授業の終わりとして残す
+      return state.phase === "summarizing"
+        ? { ...enter(state), phase: "summarized", summary: event.summary }
+        : state;
+
+    case "summaryFailed":
+      return state.phase === "chime" || state.phase === "summarizing"
+        ? { ...enter(state, { notice: SUMMARY_FAILED_MESSAGE }), phase: "summaryFailed" }
+        : state;
+
+    case "retrySummary":
+      return state.phase === "summaryFailed"
+        ? { ...enter(state, { notice: CHIME_MESSAGE }), phase: "summarizing" }
+        : state;
+
     case "timeUp":
       switch (state.phase) {
         case "idle":
@@ -255,6 +293,9 @@ export function lessonReducer(state: LessonState, event: LessonEvent): LessonSta
             timeUp: true,
           });
         case "chime":
+        case "summarizing":
+        case "summaryFailed":
+        case "summarized":
           return state;
         default:
           // 開始の発話、認識、応答、発話の途中は、終わるまで待ってからチャイムにする

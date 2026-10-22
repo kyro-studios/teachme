@@ -4,6 +4,7 @@ import { Board, type BoardFigure, type BoardHandle } from "../../shared/board";
 import { Button } from "../../shared/ui/Button";
 import type { LessonEntry } from "./lesson-api";
 import { type Speaker } from "./lesson-state";
+import { LessonSummaryPanel } from "./LessonSummaryPanel";
 import { useLessonSession } from "./use-lesson-session";
 
 /** 授業の画面の注意 (仕様書 5.5、10 節) */
@@ -21,13 +22,18 @@ export type LessonSessionProps = {
   figures: BoardFigure[];
 };
 
-// 授業の画面 (仕様書 5.5、architecture 5.4)。左にボード、右にキャラクターと字幕と「話す」を置く
+// 授業の画面 (仕様書 5.5、architecture 5.4)。左にボード、右にキャラクターと字幕と「話す」を置く。
+// チャイムの後は、まとめノートに替える。ボードは、画像を取った後も残す (隠すだけで、作り直さない)
 export function LessonSession({ entry, figures }: LessonSessionProps) {
   const boardRef = useRef<BoardHandle>(null);
-  const { state, pressTalk } = useLessonSession(entry, boardRef);
+  const { state, pressTalk, pressRetrySummary } = useLessonSession(entry, boardRef);
 
   const recording = state.phase === "recording";
   const canTalk = state.phase === "idle" || recording;
+  const inSummary =
+    state.phase === "summarizing" ||
+    state.phase === "summaryFailed" ||
+    state.phase === "summarized";
 
   return (
     <main className="flex h-dvh flex-col gap-4 px-6 py-4">
@@ -36,7 +42,13 @@ export function LessonSession({ entry, figures }: LessonSessionProps) {
         <p className="text-lg text-slate-900">{PRIVACY_NOTICE}</p>
       </header>
 
-      <div className="flex min-h-0 flex-1 gap-6">
+      {state.notice ? (
+        <p role="alert" className="text-lg font-bold text-red-700">
+          {state.notice}
+        </p>
+      ) : null}
+
+      <div className={`min-h-0 flex-1 gap-6 ${inSummary ? "hidden" : "flex"}`}>
         <section
           aria-label="ボード"
           className="min-w-0 flex-1 overflow-hidden rounded-xl border-2 border-slate-400 bg-white"
@@ -71,16 +83,21 @@ export function LessonSession({ entry, figures }: LessonSessionProps) {
               </li>
             ))}
           </ol>
-          {state.notice ? (
-            <p role="alert" className="text-lg font-bold text-red-700">
-              {state.notice}
-            </p>
-          ) : null}
           <Button className="w-full" disabled={!canTalk} onClick={pressTalk}>
             {recording ? "話し終える" : "話す"}
           </Button>
         </aside>
       </div>
+
+      {inSummary ? (
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <LessonSummaryPanel
+            summary={state.phase === "summarized" ? state.summary : null}
+            failed={state.phase === "summaryFailed"}
+            onRetry={pressRetrySummary}
+          />
+        </div>
+      ) : null}
     </main>
   );
 }
