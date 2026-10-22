@@ -15,6 +15,7 @@ public final class Repositories {
   private final DialogueRepository dialogues;
   private final MaterialRepository materials;
   private final MockExamRepository mockExams;
+  private final RecordRepository records;
 
   public Repositories(DataSource dataSource) {
     DSLContext dsl = DSL.using(dataSource, SQLDialect.POSTGRES);
@@ -25,6 +26,7 @@ public final class Repositories {
     this.dialogues = new DialogueRepository(dsl);
     this.materials = new MaterialRepository(dsl);
     this.mockExams = new MockExamRepository(dsl);
+    this.records = new RecordRepository(dsl);
   }
 
   public SettingsRepository settings() {
@@ -53,5 +55,9 @@ public final class Repositories {
 
   public MockExamRepository mockExams() {
     return mockExams;
+  }
+
+  public RecordRepository records() {
+    return records;
   }
 }
