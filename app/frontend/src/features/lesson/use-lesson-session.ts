@@ -1,15 +1,16 @@
 // 授業の進行の副作用。状態機械 (lesson-state) の状態を見て、録音、API、音声、ボード、時計を動かし、結果を事象として返す
-import { useQuery } from "@tanstack/react-query";
-import { useEffect, useReducer, useRef, useState, type RefObject } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useReducer, useRef, type RefObject } from "react";
 import { ApiError } from "../../api/client";
 import { configQuery } from "../../api/queries";
 import { playChime } from "../../shared/audio/chime";
-import { playAudio } from "../../shared/audio/player";
+import { playAudio, type Playback } from "../../shared/audio/player";
 import { RecordingError, startRecording, type Recording } from "../../shared/audio/recorder";
 import type { BoardHandle, Region } from "../../shared/board";
 import {
   abandonLesson,
-  lessonAudioUrl,
+  forgetLessonEntry,
+  loadLessonAudio,
   replyToUtterance,
   sendUtterance,
   type LessonEntry,
@@ -23,7 +24,7 @@ import {
   replySpeech,
   type LessonState,
 } from "./lesson-state";
-import { clockOffset, penWaitMs, PEN_POLL_MS, remainingUntil } from "./lesson-timing";
+import { penWaitMs, PEN_POLL_MS, remainingUntil } from "./lesson-timing";
 
 /** 1 回の発話の入力。認識に録音を、応答にボードの画像と指している範囲を使う */
 type Utterance = { blob: Blob; image: Blob; pointedRegions: Region[] };
@@ -38,32 +39,63 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
   const [state, dispatch] = useReducer(lessonReducer, entry, (start) =>
     createLessonState(openingSpeech(start.opening)),
   );
-  const [offset] = useState(() => clockOffset(entry.serverNow, Date.now()));
+  const queryClient = useQueryClient();
 
   const recordingRef = useRef<Promise<Recording> | null>(null);
   const utteranceRef = useRef<Utterance | null>(null);
   const placedRef = useRef<LessonState["shown"]>(null);
   const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const audioRef = useRef<{ turnId: string; src: Promise<string> } | null>(null);
 
   // 期限。達したら、状態ごとの扱いは reducer が決める
   useEffect(() => {
     const timer = setTimeout(
       () => dispatch({ type: "timeUp" }),
-      remainingUntil(entry.deadlineAt, offset, Date.now()),
+      remainingUntil(entry.deadlineAt, entry.clockOffset, Date.now()),
     );
     return () => clearTimeout(timer);
-  }, [entry.deadlineAt, offset]);
+  }, [entry.deadlineAt, entry.clockOffset]);
 
-  // 開始の発話と、AI 生徒の応答の音声。音声が出せないときも、字幕だけで続ける
+  // AI 生徒の発話の音声。応答が届いた時点 (holding) から取り始め、ペンの待ちと生成を重ねる。1 つの発話につき 1 回だけ取る
+  const audioSourceFor = (turnId: string): Promise<string> => {
+    if (audioRef.current?.turnId !== turnId) {
+      audioRef.current = { turnId, src: loadLessonAudio(entry.lessonId, turnId) };
+    }
+    return audioRef.current.src;
+  };
+  useEffect(() => {
+    if (state.phase === "opening" || state.phase === "holding") {
+      void audioSourceFor(state.speech.turnId);
+    }
+  }, [state.seq, entry.lessonId]);
+
+  // 開始の発話と、AI 生徒の応答の再生。字幕を出すときに始める。音声が出せないときも、字幕だけで続ける
   useEffect(() => {
     if (state.phase !== "opening" && state.phase !== "speaking") {
       return;
     }
-    const playback = playAudio(lessonAudioUrl(entry.lessonId, state.speech.turnId), {
-      onEnd: () => dispatch({ type: "speechEnded" }),
-      onError: () => dispatch({ type: "speechEnded" }),
+    let playback: Playback | undefined;
+    let active = true;
+    void audioSourceFor(state.speech.turnId).then((src) => {
+      if (!active) {
+        return;
+      }
+      // 再生が終わったら、取った音声の URL を捨てる
+      playback = playAudio(src, {
+        onEnd: () => {
+          releaseAudio(src);
+          dispatch({ type: "speechEnded" });
+        },
+        onError: () => {
+          releaseAudio(src);
+          dispatch({ type: "speechEnded" });
+        },
+      });
     });
-    return () => playback.stop();
+    return () => {
+      active = false;
+      playback?.stop();
+    };
   }, [state.seq, entry.lessonId]);
 
   // AI 生徒の印は、字幕と同時に 1 回だけ書く
@@ -216,6 +248,8 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
   useEffect(() => {
     clearTimeout(leaveTimerRef.current);
     const leave = () => {
+      // 中断した授業の開始の結果は捨てる。戻る、進むで来ても、中断された授業は出さない
+      forgetLessonEntry(queryClient, entry.lessonId);
       void abandonLesson(entry.lessonId, { keepalive: true }).catch(() => undefined);
     };
     window.addEventListener("pagehide", leave);
@@ -223,7 +257,7 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
       window.removeEventListener("pagehide", leave);
       leaveTimerRef.current = setTimeout(leave, 0);
     };
-  }, [entry.lessonId]);
+  }, [entry.lessonId, queryClient]);
 
   /** 「話す」と「話し終える」。同じボタンで、状態に応じて働く */
   const pressTalk = () => {
@@ -238,6 +272,13 @@ export function useLessonSession(entry: LessonEntry, boardRef: RefObject<BoardHa
   };
 
   return { state, pressTalk };
+}
+
+/** 音声が URL の作成 (blob:) だったときは、取り消す。外部の URL には何もしない */
+function releaseAudio(src: string): void {
+  if (src.startsWith("blob:")) {
+    URL.revokeObjectURL(src);
+  }
 }
 
 function isLimitReached(error: unknown): boolean {

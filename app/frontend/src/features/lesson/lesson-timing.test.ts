@@ -10,6 +10,15 @@ describe("期限の時計", () => {
     expect(remainingUntil("2026-10-22T10:01:05Z", offset, deviceNow)).toBe(60_000);
   });
 
+  test("ずれは受け取った時点で決め、あとから画面を読み込んでも、期限は延びない", () => {
+    // 開始の結果を受け取った時点 (端末の時計は 10:00:00) で、ずれを決める
+    const receivedAt = Date.parse("2026-10-22T10:00:00Z");
+    const offset = clockOffset("2026-10-22T10:00:00Z", receivedAt);
+
+    // 画面の読み込みに 30 秒かかっても、残りは 30 秒のまま (期限は 10:01:00)
+    expect(remainingUntil("2026-10-22T10:01:00Z", offset, receivedAt + 30_000)).toBe(30_000);
+  });
+
   test("期限を過ぎていれば、残りは 0", () => {
     const deviceNow = Date.parse("2026-10-22T10:00:00Z");
     const offset = clockOffset("2026-10-22T10:00:00Z", deviceNow);

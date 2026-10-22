@@ -1,7 +1,8 @@
 // 授業の API (仕様書 5.5、architecture 2.2)。授業の開始の結果は、画面へ渡すために問い合わせのキャッシュに置く
-import { queryOptions, useMutation, useQueryClient } from "@tanstack/react-query";
+import { queryOptions, useMutation, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { apiFetch } from "../../api/client";
 import type { components } from "../../api/schema";
+import { clockOffset } from "./lesson-timing";
 
 export type LessonStart = components["schemas"]["LessonStart"];
 export type LessonReply = components["schemas"]["LessonReply"];
@@ -10,14 +11,23 @@ export type MaterialSummary = components["schemas"]["MaterialSummary"];
 export type Region = components["schemas"]["Region"];
 
 /**
- * 授業の画面が受け取るもの。開始の結果に、図表の画像を取る教材の ID を足す
- * (開始の結果には教材の ID が無いため。`GET /materials/{id}/images/{position}` で使う)
+ * 授業の画面が受け取るもの。開始の結果に、次の 2 つを足す
+ * - 図表の画像を取る教材の ID (開始の結果には教材の ID が無いため。`GET /materials/{id}/images/{position}` で使う)
+ * - 開始の結果を受け取った時点の、サーバーの時計と端末の時計のずれ (画面の読み込みの時間を、期限に含めないため)
  */
-export type LessonEntry = LessonStart & { materialId: string };
+export type LessonEntry = LessonStart & { materialId: string; clockOffset: number };
 
 /** 授業の開始の結果のキャッシュのキー。授業の画面は、ここから受け取る */
 export function lessonEntryKey(lessonId: string) {
   return ["lesson-entry", lessonId] as const;
+}
+
+/**
+ * 中断した授業の開始の結果を、キャッシュから捨てる。戻る、進むで同じ授業へ来ても、
+ * 中断された授業を表示しないようにする (LessonPage は、無ければ授業の開始の画面へ戻す)
+ */
+export function forgetLessonEntry(queryClient: QueryClient, lessonId: string): void {
+  queryClient.removeQueries({ queryKey: lessonEntryKey(lessonId) });
 }
 
 /** 授業に使える教材 (整理済み) の一覧。`GET /materials` のうち、`organized` だけ */
@@ -38,7 +48,8 @@ export function useStartLesson() {
         method: "POST",
         body: { materialId },
       });
-      return { ...start, materialId };
+      // 受け取った時点で、時計のずれを決める。あとから画面を読み込んでも、その時間は期限に響かない
+      return { ...start, materialId, clockOffset: clockOffset(start.serverNow, Date.now()) };
     },
     onSuccess: (entry) => {
       queryClient.setQueryData(lessonEntryKey(entry.lessonId), entry);
@@ -83,6 +94,23 @@ export function abandonLesson(lessonId: string, options: { keepalive?: boolean }
 /** AI 生徒の発話の音声の URL (`GET /lessons/{id}/turns/{turnId}/audio`)。発話ごとに 1 回だけ生成される */
 export function lessonAudioUrl(lessonId: string, turnId: string): string {
   return `/api/lessons/${lessonId}/turns/${turnId}/audio`;
+}
+
+/**
+ * AI 生徒の発話の音声を、先に全部取る (NFR-101。応答の後の待ちと、ペンの待ちを重ねる)。
+ * 返すのは再生に使う URL。取れなかったときは、音声の URL をそのまま返し、再生のときに失敗させる (字幕だけで続ける)
+ */
+export async function loadLessonAudio(lessonId: string, turnId: string): Promise<string> {
+  const src = lessonAudioUrl(lessonId, turnId);
+  try {
+    const response = await fetch(src);
+    if (!response.ok) {
+      return src;
+    }
+    return URL.createObjectURL(await response.blob());
+  } catch {
+    return src;
+  }
 }
 
 /**
