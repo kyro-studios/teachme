@@ -1,4 +1,5 @@
 import { useParams } from "react-router";
+import { StartConsultationButton } from "../features/consultation/StartConsultationButton";
 import { MaterialDetail } from "../features/materials/MaterialDetail";
 import { failureMessage } from "../features/materials/material-text";
 import { useMaterial } from "../features/materials/use-materials";
@@ -24,7 +25,10 @@ export function MaterialDetailPage() {
 
   return (
     <PageFrame title={`教材 ${material.data.number}`}>
-      <MaterialDetail material={material.data} />
+      <MaterialDetail
+        material={material.data}
+        consultation={<StartConsultationButton materialId={material.data.id} />}
+      />
     </PageFrame>
   );
 }

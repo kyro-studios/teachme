@@ -7,8 +7,15 @@ import { RetryMaterialButton } from "./RetryMaterialButton";
 import { failureMessage } from "./material-text";
 import { useDeleteMaterial, type MaterialDetail as MaterialDetailData } from "./use-materials";
 
-// 教材の詳細 (仕様書 5.3、5.9)。整理が済んだ教材は、問題、模範解答、解説、生徒の途中の解答、指導のポイントを見出しの下に出す
-export function MaterialDetail({ material }: { material: MaterialDetailData }) {
+// 教材の詳細 (仕様書 5.3、5.9)。整理が済んだ教材は、問題、模範解答、解説、生徒の途中の解答、指導のポイントを見出しの下に出す。
+// 「先輩先生に相談する」(5.4) は、features どうしで依存しないため、呼び出し側が consultation に渡す。整理が済んだ教材でだけ出す
+export function MaterialDetail({
+  material,
+  consultation,
+}: {
+  material: MaterialDetailData;
+  consultation?: ReactNode;
+}) {
   const navigate = useNavigate();
   const remove = useDeleteMaterial();
   const { problem } = material;
@@ -61,6 +68,8 @@ export function MaterialDetail({ material }: { material: MaterialDetailData }) {
           </Section>
         </>
       ) : null}
+
+      {material.status === "organized" ? consultation : null}
 
       {/* 整理中の教材は削除しない (仕様書 7.2 の状態の遷移に合わせる)。削除の実行中は、開くボタンも無効にして二重に押せないようにする */}
       {material.status !== "organizing" ? (
