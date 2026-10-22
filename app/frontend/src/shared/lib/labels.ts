@@ -5,3 +5,21 @@ export const SUBJECT_LABELS: Readonly<Record<"math" | "science", string>> = {
   math: "数学",
   science: "理科",
 };
+
+/** 今日のモードの表示名 (openapi.yaml の TodayMode)。キーは API の TodayMode と同じ値 */
+export const TODAY_MODE_LABELS: Readonly<
+  Record<"normal" | "self_study" | "homework_check", string>
+> = {
+  normal: "通常",
+  self_study: "自習指示",
+  homework_check: "宿題の丸つけ",
+};
+
+/** 宿題の判定の文言 (仕様書 5.2、10 節)。キーは API の HomeworkResult.verdict と同じ値 */
+export const HOMEWORK_VERDICT_LABELS: Readonly<
+  Record<"correct" | "incorrect" | "undetermined", string>
+> = {
+  correct: "正解",
+  incorrect: "不正解",
+  undetermined: "判定できませんでした。撮り直してください",
+};
