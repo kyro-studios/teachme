@@ -97,6 +97,12 @@ public final class DialogueFixtures {
     return queryInt(dataSource, "select round_count from lessons where id = ?::uuid", lessonId);
   }
 
+  /** 相談の往復の数。 */
+  public static int consultationRoundCount(DataSource dataSource, UUID consultationId) {
+    return queryInt(
+        dataSource, "select round_count from consultations where id = ?::uuid", consultationId);
+  }
+
   /** 授業の度合い (3 件)。 */
   public static List<Integer> lessonDegrees(DataSource dataSource, UUID lessonId) {
     try (Connection connection = dataSource.getConnection();

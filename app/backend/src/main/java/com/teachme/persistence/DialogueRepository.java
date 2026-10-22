@@ -8,6 +8,7 @@ import static com.teachme.persistence.generated.Tables.USER_SETTINGS;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.teachme.domain.Annotation;
+import com.teachme.domain.BoardWrite;
 import com.teachme.domain.Degrees;
 import com.teachme.domain.DialogueKind;
 import com.teachme.domain.Expression;
@@ -98,6 +99,16 @@ public final class DialogueRepository {
           annotation.map(NewTurn::annotationJson).orElse(null));
     }
 
+    /**
+     * 先輩先生の字幕。ボードへの書き込みは、字幕の追加情報 (JSON) として入れる。
+     *
+     * @param boardWrites 先輩先生が書き込んだ内容。無ければ空
+     */
+    public static NewTurn mentor(String body, List<BoardWrite> boardWrites) {
+      return new NewTurn(
+          Speaker.MENTOR, body, null, boardWrites.isEmpty() ? null : boardWritesJson(boardWrites));
+    }
+
     private static String annotationJson(Annotation annotation) {
       try {
         return JSON.writeValueAsString(
@@ -107,7 +118,22 @@ public final class DialogueRepository {
       }
     }
 
+    private static String boardWritesJson(List<BoardWrite> boardWrites) {
+      try {
+        return JSON.writeValueAsString(
+            boardWrites.stream()
+                .map(
+                    write ->
+                        new StoredBoardWrite(write.kind().wireName(), write.text(), write.region()))
+                .toList());
+      } catch (JsonProcessingException e) {
+        throw new IllegalStateException("先輩先生の書き込みを JSON にできません", e);
+      }
+    }
+
     private record StoredAnnotation(String kind, OrganizedProblem.Region region) {}
+
+    private record StoredBoardWrite(String kind, String text, OrganizedProblem.Region region) {}
   }
 
   /** 親の行の、この機能で使う列。授業と相談で列の名前が違うため、まとめて持つ。 */
@@ -195,6 +221,32 @@ public final class DialogueRepository {
               .set(LESSONS.DEADLINE_AT, toOffsetDateTime(deadlineAt))
               .execute();
           insertTurn(tx, Parent.of(DialogueKind.LESSON), lessonId, turnId, opening);
+        });
+  }
+
+  /**
+   * 相談を始める。同じ利用者の進行中の相談は、中断として消す (字幕も連鎖して消える)。相談は最初の発話を持たない (利用者が話してから始まる)。
+   *
+   * <p>授業と同じく、利用者の設定の行を先に取り、同じ利用者の開始どうしを直列にする。
+   */
+  public void startConsultation(
+      UUID userId, UUID materialId, UUID consultationId, Instant startedAt, Instant deadlineAt) {
+    dsl.transaction(
+        configuration -> {
+          DSLContext tx = DSL.using(configuration);
+          tx.selectOne()
+              .from(USER_SETTINGS)
+              .where(USER_SETTINGS.USER_ID.eq(userId))
+              .forUpdate()
+              .fetch();
+          tx.deleteFrom(CONSULTATIONS).where(CONSULTATIONS.USER_ID.eq(userId)).execute();
+          tx.insertInto(CONSULTATIONS)
+              .set(CONSULTATIONS.ID, consultationId)
+              .set(CONSULTATIONS.USER_ID, userId)
+              .set(CONSULTATIONS.MATERIAL_ID, materialId)
+              .set(CONSULTATIONS.STARTED_AT, toOffsetDateTime(startedAt))
+              .set(CONSULTATIONS.DEADLINE_AT, toOffsetDateTime(deadlineAt))
+              .execute();
         });
   }
 

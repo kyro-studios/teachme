@@ -4,6 +4,7 @@ import com.teachme.ai.LanguageModel;
 import com.teachme.ai.SpeechToText;
 import com.teachme.ai.TextToSpeech;
 import com.teachme.ai.fake.FakeAi;
+import com.teachme.application.ConsultationService;
 import com.teachme.application.DialogueService;
 import com.teachme.application.DialogueSweeper;
 import com.teachme.application.HomeService;
@@ -15,6 +16,7 @@ import com.teachme.application.SettingsService;
 import com.teachme.application.TestControlService;
 import com.teachme.domain.DialogueLimits;
 import com.teachme.persistence.Repositories;
+import com.teachme.web.ConsultationRoutes;
 import com.teachme.web.HomeRoutes;
 import com.teachme.web.LessonRoutes;
 import com.teachme.web.MaterialRoutes;
@@ -69,23 +71,33 @@ public final class Main {
       speechToText = RealAi.speechToText(elevenLabs);
       textToSpeech = RealAi.textToSpeech(elevenLabs);
     }
-    // 授業の時間の上限は、テストの上書きを反映する。real では上書きは無い
+    // 授業と相談の時間の上限は、テストの上書きを反映する。real では上書きは無い
     Function<UUID, DialogueLimits> lessonLimits =
         fake ? testControl::lessonLimits : userId -> DialogueLimits.lesson();
-    routes.addAll(userRoutes(components, languageModel, speechToText, textToSpeech, lessonLimits));
+    Function<UUID, DialogueLimits> consultationLimits =
+        fake ? testControl::consultationLimits : userId -> DialogueLimits.consultation();
+    routes.addAll(
+        userRoutes(
+            components,
+            languageModel,
+            speechToText,
+            textToSpeech,
+            lessonLimits,
+            consultationLimits));
     if (fake) {
       routes.add(new TestRoutes(testControl));
     }
     return routes;
   }
 
-  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ、教材、授業)。 */
+  /** 利用者ごとの機能 (初期セットアップ、ホーム、今日のモード、宿題の丸つけ、教材、授業、先輩先生への相談)。 */
   private static List<Routes> userRoutes(
       Components components,
       LanguageModel languageModel,
       SpeechToText speechToText,
       TextToSpeech textToSpeech,
-      Function<UUID, DialogueLimits> lessonLimits) {
+      Function<UUID, DialogueLimits> lessonLimits,
+      Function<UUID, DialogueLimits> consultationLimits) {
     Repositories repositories = new Repositories(components.dataSource());
     SettingsService settings = new SettingsService(repositories.settings(), components.clock());
     HomeService home =
@@ -115,11 +127,21 @@ public final class Main {
             languageModel,
             lessonLimits,
             components.clock());
+    ConsultationService consultations =
+        new ConsultationService(
+            settings,
+            dialogue,
+            repositories.dialogues(),
+            repositories.materials(),
+            languageModel,
+            consultationLimits,
+            components.clock());
     DialogueSweeper sweeper = new DialogueSweeper(repositories.dialogues(), components.clock());
     return List.of(
         new SettingsRoutes(settings),
         new HomeRoutes(home, homework),
         new MaterialRoutes(materials, organizer),
-        new LessonRoutes(lessons, sweeper));
+        new LessonRoutes(lessons, sweeper),
+        new ConsultationRoutes(consultations));
   }
 }
